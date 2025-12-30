@@ -44,20 +44,45 @@ class SimParams(BaseModel):
     outflows: List[Stream]
     other_assets: List[OtherAsset] = []
 
-# --- HELPER: FEDERAL TAX CALCULATOR (2025) ---
-def calculate_federal_tax(taxable_income: float) -> float:
-    std_deduction = 29200 
-    income = max(0, taxable_income - std_deduction)
-    brackets = [(23200, 0.10), (94300, 0.12), (201050, 0.22), (383900, 0.24), (487450, 0.32), (731200, 0.35)]
-    tax = 0
-    prev_limit = 0
-    for limit, rate in brackets:
-        if income > prev_limit:
-            amt = min(income, limit) - prev_limit
-            tax += amt * rate
-            prev_limit = limit
-        else:
+# --- HELPER: FEDERAL TAX CALCULATOR (Base-year brackets, inflated forward) ---
+def calculate_federal_tax(taxable_income: float, years_passed: int = 0, inflation: float = 0.0) -> float:
+    """Estimate federal tax while avoiding bracket creep.
+
+    We treat the bracket thresholds + standard deduction as being indexed to inflation,
+    so that *real* income doesn't drift into higher brackets just because the model
+    inflates nominal dollars over time.
+    """
+
+    inflation_factor = (1 + (inflation or 0.0)) ** max(0, years_passed)
+
+    # Base-year (2025-ish) values used by this model.
+    std_deduction_base = 29200
+    brackets_base = [
+        (23200, 0.10),
+        (94300, 0.12),
+        (201050, 0.22),
+        (383900, 0.24),
+        (487450, 0.32),
+        (731200, 0.35),
+    ]
+
+    std_deduction = std_deduction_base * inflation_factor
+    income = max(0.0, taxable_income - std_deduction)
+
+    tax = 0.0
+    prev_limit = 0.0
+    for limit_base, rate in brackets_base:
+        limit = limit_base * inflation_factor
+        if income <= prev_limit:
             break
+        amt = min(income, limit) - prev_limit
+        tax += amt * rate
+        prev_limit = limit
+
+    # If income exceeds the last bracket threshold, apply the top rate to the remainder.
+    if income > prev_limit:
+        tax += (income - prev_limit) * 0.37
+
     return tax
 
 # --- HELPER: RMD FACTOR (IRS Uniform Lifetime Table) ---
@@ -155,7 +180,7 @@ def run_simulation(params: SimParams):
                           inc_tracker["social_security"] + inc_tracker["retirement_withdrawals"] + 
                           inc_tracker["other_income"])
         
-        tax_bill = calculate_federal_tax(taxable_income)
+        tax_bill = calculate_federal_tax(taxable_income, years_passed=years_passed, inflation=params.general_inflation)
         mandatory_net = taxable_income - tax_bill
         
         # 5. GAP ANALYSIS
@@ -267,7 +292,7 @@ def run_simulation(params: SimParams):
                         if needed <= 0: break
         
         # 6. RE-CALCULATE TAXES (With final withdrawals included)
-        final_tax = calculate_federal_tax(taxable_income)
+        final_tax = calculate_federal_tax(taxable_income, years_passed=years_passed, inflation=params.general_inflation)
         effective_tax_rate = final_tax / taxable_income if taxable_income > 0 else 0
         
         # 7. PREPARE CHART DATA (After-Tax versions)
