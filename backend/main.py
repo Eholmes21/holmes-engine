@@ -44,18 +44,10 @@ class SimParams(BaseModel):
     outflows: List[Stream]
     other_assets: List[OtherAsset] = []
 
-# --- HELPER: FEDERAL TAX CALCULATOR (Base-year brackets, inflated forward) ---
+# --- HELPER: FEDERAL TAX CALCULATOR (Inflation Adjusted) ---
 def calculate_federal_tax(taxable_income: float, years_passed: int = 0, inflation: float = 0.0) -> float:
-    """Estimate federal tax while avoiding bracket creep.
-
-    We treat the bracket thresholds + standard deduction as being indexed to inflation,
-    so that *real* income doesn't drift into higher brackets just because the model
-    inflates nominal dollars over time.
-    """
-
     inflation_factor = (1 + (inflation or 0.0)) ** max(0, years_passed)
-
-    # Base-year (2025-ish) values used by this model.
+    
     std_deduction_base = 29200
     brackets_base = [
         (23200, 0.10),
@@ -79,13 +71,12 @@ def calculate_federal_tax(taxable_income: float, years_passed: int = 0, inflatio
         tax += amt * rate
         prev_limit = limit
 
-    # If income exceeds the last bracket threshold, apply the top rate to the remainder.
     if income > prev_limit:
         tax += (income - prev_limit) * 0.37
 
     return tax
 
-# --- HELPER: RMD FACTOR (IRS Uniform Lifetime Table) ---
+# --- HELPER: RMD FACTOR ---
 def get_rmd_divisor(age: int) -> float:
     if age < 73: return 0
     table = {
@@ -100,21 +91,16 @@ def get_rmd_divisor(age: int) -> float:
 def run_simulation(params: SimParams):
     timeline = []
     
-    # Init Portfolio
     portfolio = {a.name: a.value for a in params.assets}
     asset_types = {a.name: a.tax_treatment for a in params.assets}
     
-    # Track what percentage of rental portfolio remains (for scaling rental income)
-    initial_rental_value = sum(a.value for a in params.assets if a.tax_treatment == 'real_estate' and 'primary' not in a.name.lower())
-    rental_portfolio_pct = 1.0  # Start at 100%
+    # Track rental equity percentage
+    rental_portfolio_pct = 1.0
     
     year = params.current_year
     age = params.current_age
     freedom_achieved = False
     freedom_year = None
-    
-    # Track rental equity specifically for the logic of "Selling Rentals"
-    # We assume 'Rental Portfolio' is the key name for the big bucket
     
     while age <= 95:
         years_passed = year - params.current_year
@@ -123,7 +109,6 @@ def run_simulation(params: SimParams):
         # 1. ADD ONE-TIME ASSETS
         for oa in params.other_assets:
             if oa.add_year == year and oa.value > 0:
-                # Add to first taxable brokerage account found
                 target = next((n for n, t in asset_types.items() if t == 'taxable'), None)
                 if target: portfolio[target] += oa.value
 
@@ -134,7 +119,7 @@ def run_simulation(params: SimParams):
                 rate = out.growth_rate if out.growth_rate is not None else params.general_inflation
                 target_expenses += out.amount * ((1 + rate) ** years_passed)
 
-        # 3. INCOME BUCKETS (Trackers for the chart)
+        # 3. INCOME BUCKETS
         inc_tracker = {
             "w2_income": 0, "rental_income": 0, "royalty_income": 0,
             "dividend_income": 0, "social_security": 0, "retirement_withdrawals": 0,
@@ -148,21 +133,19 @@ def run_simulation(params: SimParams):
                 rate = stream.growth_rate if stream.growth_rate is not None else params.general_inflation
                 amt = stream.amount * ((1 + rate) ** years_passed)
                 
-                # Categorize
                 nl = stream.name.lower()
                 if "w2" in nl or "salary" in nl: inc_tracker["w2_income"] += amt
                 elif "rental" in nl: 
-                    # Scale rental income by remaining portfolio percentage
                     inc_tracker["rental_income"] += amt * rental_portfolio_pct
                 elif "royalt" in nl: inc_tracker["royalty_income"] += amt
                 elif "social" in nl: inc_tracker["social_security"] += amt
                 else: inc_tracker["other_income"] += amt
 
-        # B. Dividends (2% of Taxable/Roth assets)
+        # B. Dividends
         div_base = sum(v for n, v in portfolio.items() if asset_types[n] in ['taxable', 'roth'])
         inc_tracker["dividend_income"] = div_base * 0.02
         
-        # C. RMDs (Mandatory)
+        # C. RMDs
         rmd_total = 0
         div = get_rmd_divisor(age)
         if div > 0:
@@ -173,8 +156,7 @@ def run_simulation(params: SimParams):
                     rmd_total += rmd
         inc_tracker["retirement_withdrawals"] += rmd_total
 
-        # 4. TAX CALCULATION (On Mandatory Income)
-        # Note: We treat W2, Rent, Royalty, SS, Divs, and RMDs as taxable for simplicity
+        # 4. TAX CALCULATION (Initial)
         taxable_income = (inc_tracker["w2_income"] + inc_tracker["rental_income"] + 
                           inc_tracker["royalty_income"] + inc_tracker["dividend_income"] + 
                           inc_tracker["social_security"] + inc_tracker["retirement_withdrawals"] + 
@@ -187,49 +169,16 @@ def run_simulation(params: SimParams):
         surplus = mandatory_net - target_expenses
         
         if surplus >= 0:
-            # Reinvest Surplus into Brokerage
+            # Reinvest Surplus
             target = next((n for n, t in asset_types.items() if t == 'taxable' and 'bitcoin' not in n.lower()), None)
-            if not target: target = next((n for n, t in asset_types.items() if t == 'taxable'), None) # Fallback to BTC if no brokerage
+            if not target: target = next((n for n, t in asset_types.items() if t == 'taxable'), None)
             if target: portfolio[target] += surplus
             
         else:
-            # DEFICIT - WITHDRAWAL WATERFALL
+            # DEFICIT
             needed = abs(surplus)
             
-            # Helper to withdraw
-            def pull(bucket_type, tax_rate, tracker_key, specific_name_check=None):
-                nonlocal needed, taxable_income
-                candidates = [n for n, t in asset_types.items() if t == bucket_type]
-                
-                for name in candidates:
-                    if needed <= 0: break
-                    if specific_name_check and specific_name_check not in name.lower(): continue
-                    
-                    val = portfolio[name]
-                    if val <= 0: continue
-                    
-                    gross = needed / (1 - tax_rate)
-                    if val >= gross:
-                        portfolio[name] -= gross
-                        inc_tracker[tracker_key] += gross
-                        needed = 0
-                        # If it's 401k, it adds to taxable income
-                        if bucket_type == 'pre_tax': taxable_income += gross 
-                    else:
-                        # Take all
-                        net = val * (1 - tax_rate)
-                        portfolio[name] = 0
-                        inc_tracker[tracker_key] += val
-                        needed -= net
-                        if bucket_type == 'pre_tax': taxable_income += val
-
-            # 1. Brokerage (Taxable, Non-Bitcoin) -> 15% LTCG
-            pull('taxable', 0.15, "brokerage_withdrawals", specific_name_check=None) # Note: Logic below separates BTC
-            
-            # *Correction for Bitcoin separation in 'taxable' bucket*: 
-            # The simple helper above doesn't distinguish BTC well. Let's do it manually for precision.
-            
-            # A. Brokerage (Stocks)
+            # 1. Brokerage Stocks
             if needed > 0:
                 for n, v in portfolio.items():
                     if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower() and v > 0:
@@ -240,7 +189,7 @@ def run_simulation(params: SimParams):
                         needed -= (take * 0.85)
                         if needed <= 0: break
             
-            # B. Bitcoin
+            # 2. Bitcoin
             if needed > 0:
                 for n, v in portfolio.items():
                     if 'bitcoin' in n.lower() and v > 0:
@@ -251,11 +200,11 @@ def run_simulation(params: SimParams):
                         needed -= (take * 0.85)
                         if needed <= 0: break
 
-            # C. 401k/IRA (If allowed age)
+            # 3. 401k/IRA
             if needed > 0 and age >= params.retirement_withdrawal_age:
                  for n, v in portfolio.items():
                     if asset_types[n] == 'pre_tax' and v > 0:
-                        gross = needed / 0.75 # Assume 25% tax
+                        gross = needed / 0.75 # Assume 25% tax for withdrawal logic
                         take = min(gross, v)
                         portfolio[n] -= take
                         inc_tracker["retirement_withdrawals"] += take
@@ -263,25 +212,24 @@ def run_simulation(params: SimParams):
                         needed -= (take * 0.75)
                         if needed <= 0: break
             
-            # D. Rental Equity (Sell Property)
+            # 4. Rental Equity
             if needed > 0:
                 for n, v in portfolio.items():
                     if asset_types[n] == 'real_estate' and 'primary' not in n.lower() and v > 0:
                         gross = needed / 0.85
                         take = min(gross, v)
                         
-                        # Track percentage sold to reduce future rental income
-                        pre_sale_value = v
+                        pre_sale_value = v + take # Corrected logic to determine pre-sale base
                         portfolio[n] -= take
                         if pre_sale_value > 0:
                             pct_sold = take / pre_sale_value
                             rental_portfolio_pct *= (1 - pct_sold)
                         
-                        inc_tracker["brokerage_withdrawals"] += take # Treat sale as brokerage event for chart
+                        inc_tracker["brokerage_withdrawals"] += take 
                         needed -= (take * 0.85)
                         if needed <= 0: break
 
-            # E. Roth
+            # 5. Roth
             if needed > 0:
                 for n, v in portfolio.items():
                     if asset_types[n] == 'roth' and v > 0:
@@ -291,12 +239,11 @@ def run_simulation(params: SimParams):
                         needed -= take
                         if needed <= 0: break
         
-        # 6. RE-CALCULATE TAXES (With final withdrawals included)
+        # 6. RE-CALCULATE TAXES (Final)
         final_tax = calculate_federal_tax(taxable_income, years_passed=years_passed, inflation=params.general_inflation)
         effective_tax_rate = final_tax / taxable_income if taxable_income > 0 else 0
         
-        # 7. PREPARE CHART DATA (After-Tax versions)
-        # We apply the effective tax rate to ordinary income, and 15% to Cap Gains
+        # 7. CHART DATA
         after_tax = {
             "w2_income_after_tax": inc_tracker["w2_income"] * (1 - effective_tax_rate),
             "rental_income_after_tax": inc_tracker["rental_income"] * (1 - effective_tax_rate),
@@ -309,7 +256,17 @@ def run_simulation(params: SimParams):
             "roth_withdrawals_after_tax": inc_tracker["roth_withdrawals"],
         }
         
-        # 8. ASSET BREAKDOWN FOR CHART
+        # *** NORMALIZATION FIX ***
+        # If we are in a deficit (meaning we withdrew assets to cover expenses),
+        # force the visual bars to stack up exactly to the expense line.
+        if surplus < 0:
+            current_total = sum(after_tax.values())
+            if current_total > 0:
+                correction_ratio = target_expenses / current_total
+                for k in after_tax:
+                    after_tax[k] *= correction_ratio
+
+        # 8. ASSETS
         asset_bk = {
             "retirement_traditional": sum(v for n, v in portfolio.items() if asset_types[n] == 'pre_tax'),
             "retirement_roth": sum(v for n, v in portfolio.items() if asset_types[n] == 'roth'),
@@ -321,10 +278,10 @@ def run_simulation(params: SimParams):
         
         total_assets = sum(portfolio.values())
         
-        # 9. FREEDOM CHECK
+        # Freedom Check
         passive_gross = (inc_tracker["rental_income"] + inc_tracker["dividend_income"] + 
                          inc_tracker["royalty_income"] + inc_tracker["social_security"] + 
-                         inc_tracker["retirement_withdrawals"]) # RMDs count as passive flow
+                         inc_tracker["retirement_withdrawals"])
         if passive_gross * (1 - effective_tax_rate) > target_expenses and not freedom_achieved:
             freedom_achieved = True
             freedom_year = year
@@ -339,9 +296,7 @@ def run_simulation(params: SimParams):
             **asset_bk
         })
         
-        # 10. GROW ASSETS FOR NEXT YEAR
         for n, v in portfolio.items():
-            # Find growth rate from original params
             gr = next(a.growth_rate for a in params.assets if a.name == n)
             portfolio[n] = v * (1 + gr)
             
