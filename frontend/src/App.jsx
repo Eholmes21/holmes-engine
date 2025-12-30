@@ -28,6 +28,10 @@ const DEFAULT_OTHER_ASSETS = [
   { name: "Other Asset 1", value: 500000, add_year: 2030 },
   { name: "Other Asset 2", value: 0, add_year: 2035 }
 ];
+const DEFAULT_ONE_TIME_EXPENSES = [
+  { name: "One-Time Expense 1", amount: 0, year: 2030, add_to_primary_home: false },
+  { name: "One-Time Expense 2", amount: 0, year: 2035, add_to_primary_home: false }
+];
 const DEFAULT_RATES = { inflation: 3.5, stockGrowth: 5, realEstateGrowth: 2.0, retireAge: 48 };
 
 // Randomize helper
@@ -40,6 +44,7 @@ const getRandomizedAssets = () => DEFAULT_ASSETS.map(a => ({ ...a, value: random
 const getRandomizedInflows = () => DEFAULT_INFLOWS.map(i => ({ ...i, amount: randomizeValue(i.amount), growth_rate: randomizeRate(i.growth_rate) }));
 const getRandomizedOutflows = () => DEFAULT_OUTFLOWS.map(o => ({ ...o, amount: randomizeValue(o.amount) }));
 const getRandomizedOtherAssets = () => DEFAULT_OTHER_ASSETS.map(a => ({ ...a, value: randomizeValue(a.value) }));
+const getRandomizedOneTimeExpenses = () => DEFAULT_ONE_TIME_EXPENSES.map(e => ({ ...e, amount: randomizeValue(e.amount) }));
 
 export default function App() {
   const [data, setData] = useState(null);
@@ -69,6 +74,9 @@ export default function App() {
   // One-time asset additions - start randomized
   const [otherAssets, setOtherAssets] = useState(getRandomizedOtherAssets);
 
+  // One-time expenses - start randomized
+  const [oneTimeExpenses, setOneTimeExpenses] = useState(getRandomizedOneTimeExpenses);
+
   // Konami Code: ↑↑↓↓←→←→BA
   useEffect(() => {
     const konamiCode = ['ArrowUp', 'ArrowUp', 'ArrowDown', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ArrowLeft', 'ArrowRight', 'KeyB', 'KeyA'];
@@ -83,6 +91,7 @@ export default function App() {
           setInflows(DEFAULT_INFLOWS.map(i => ({ ...i })));
           setOutflows(DEFAULT_OUTFLOWS.map(o => ({ ...o })));
           setOtherAssets(DEFAULT_OTHER_ASSETS.map(a => ({ ...a })));
+          setOneTimeExpenses(DEFAULT_ONE_TIME_EXPENSES.map(e => ({ ...e })));
           setInflation(DEFAULT_RATES.inflation);
           setStockGrowth(DEFAULT_RATES.stockGrowth);
           setRealEstateGrowth(DEFAULT_RATES.realEstateGrowth);
@@ -134,7 +143,8 @@ export default function App() {
             assets: apiAssets,
             inflows: apiInflows,
             outflows: apiOutflows,
-            other_assets: otherAssets
+            other_assets: otherAssets,
+            one_time_expenses: oneTimeExpenses
           })
         });
 
@@ -161,7 +171,7 @@ export default function App() {
       }
     };
     runSim();
-  }, [API_URL, currentAge, retireAge, inflation, stockGrowth, realEstateGrowth, retirementWithdrawalAge, assets, inflows, outflows, otherAssets]);
+  }, [API_URL, currentAge, retireAge, inflation, stockGrowth, realEstateGrowth, retirementWithdrawalAge, assets, inflows, outflows, otherAssets, oneTimeExpenses]);
 
   // Update asset growth rates when global rates change
   useEffect(() => {
@@ -278,6 +288,12 @@ export default function App() {
     setOtherAssets(prev => prev.map(a => ({
       ...a,
       value: Math.round(a.value * randomizeFactor(0.5))
+    })));
+
+    // Randomize one-time expenses ±50%
+    setOneTimeExpenses(prev => prev.map(e => ({
+      ...e,
+      amount: Math.round(e.amount * randomizeFactor(0.5))
     })));
   };
 
@@ -531,6 +547,72 @@ export default function App() {
                         className={inputClass}
                       />
                     </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* One-Time Expenses */}
+            <div className={cardClass}>
+              <h3 className="text-lg font-semibold flex items-center gap-2 text-slate-300 mb-3">
+                <CreditCard size={20}/> One-Time Expenses
+              </h3>
+              <div className="space-y-3">
+                {oneTimeExpenses.map((expense, i) => (
+                  <div key={i} className="bg-slate-900 p-3 rounded-lg">
+                    <div className="grid grid-cols-3 gap-2">
+                      <div>
+                        <label className="text-xs text-slate-500">Name</label>
+                        <input
+                          value={expense.name}
+                          onChange={e => {
+                            const updated = [...oneTimeExpenses];
+                            updated[i].name = e.target.value;
+                            setOneTimeExpenses(updated);
+                          }}
+                          className={inputClass}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs text-slate-500">Amount $</label>
+                        <input
+                          type="number"
+                          value={expense.amount}
+                          onChange={e => {
+                            const updated = [...oneTimeExpenses];
+                            updated[i].amount = Number(e.target.value);
+                            setOneTimeExpenses(updated);
+                          }}
+                          className={inputClass}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs text-slate-500">Year</label>
+                        <input
+                          type="number"
+                          value={expense.year}
+                          onChange={e => {
+                            const updated = [...oneTimeExpenses];
+                            updated[i].year = Number(e.target.value);
+                            setOneTimeExpenses(updated);
+                          }}
+                          className={inputClass}
+                        />
+                      </div>
+                    </div>
+
+                    <label className="mt-2 flex items-center gap-2 text-sm text-slate-300 select-none">
+                      <input
+                        type="checkbox"
+                        checked={!!expense.add_to_primary_home}
+                        onChange={e => {
+                          const updated = [...oneTimeExpenses];
+                          updated[i].add_to_primary_home = e.target.checked;
+                          setOneTimeExpenses(updated);
+                        }}
+                      />
+                      Vacation house (add to Primary Home)
+                    </label>
                   </div>
                 ))}
               </div>

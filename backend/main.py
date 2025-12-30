@@ -32,6 +32,12 @@ class OtherAsset(BaseModel):
     value: float
     add_year: int
 
+class OneTimeExpense(BaseModel):
+    name: str
+    amount: float
+    year: int
+    add_to_primary_home: bool = False
+
 class SimParams(BaseModel):
     current_year: int = 2025
     current_age: int = 38
@@ -43,6 +49,7 @@ class SimParams(BaseModel):
     inflows: List[Stream]
     outflows: List[Stream]
     other_assets: List[OtherAsset] = []
+    one_time_expenses: List[OneTimeExpense] = []
 
 # --- HELPER: FEDERAL TAX CALCULATOR (Inflation Adjusted) ---
 def calculate_federal_tax(taxable_income: float, years_passed: int = 0, inflation: float = 0.0) -> float:
@@ -112,8 +119,18 @@ def run_simulation(params: SimParams):
                 target = next((n for n, t in asset_types.items() if t == 'taxable'), None)
                 if target: portfolio[target] += oa.value
 
+        # 1b. APPLY ONE-TIME EXPENSES (optionally convert to Primary Home equity)
+        one_time_expenses_total = 0.0
+        for exp in params.one_time_expenses:
+            if exp.year == year and exp.amount > 0:
+                one_time_expenses_total += exp.amount
+                if exp.add_to_primary_home:
+                    primary = next((n for n in portfolio.keys() if 'primary' in n.lower()), None)
+                    if primary:
+                        portfolio[primary] += exp.amount
+
         # 2. CALCULATE TARGET EXPENSES
-        target_expenses = 0
+        target_expenses = one_time_expenses_total
         for out in params.outflows:
             if out.start_year <= year <= out.end_year:
                 rate = out.growth_rate if out.growth_rate is not None else params.general_inflation
