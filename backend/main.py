@@ -168,11 +168,16 @@ def run_simulation(params: SimParams):
         # 5. GAP ANALYSIS
         surplus = mandatory_net - target_expenses
         
+        # Check if we successfully funded the year
+        # (Start assuming we have a deficit, prove otherwise)
+        fully_funded = False
+
         if surplus >= 0:
             # Reinvest Surplus
             target = next((n for n, t in asset_types.items() if t == 'taxable' and 'bitcoin' not in n.lower()), None)
             if not target: target = next((n for n, t in asset_types.items() if t == 'taxable'), None)
             if target: portfolio[target] += surplus
+            fully_funded = True
             
         else:
             # DEFICIT
@@ -187,10 +192,10 @@ def run_simulation(params: SimParams):
                         portfolio[n] -= take
                         inc_tracker["brokerage_withdrawals"] += take
                         needed -= (take * 0.85)
-                        if needed <= 0: break
+                        if needed <= 0.1: break # Use small epsilon for float precision
             
             # 2. Bitcoin
-            if needed > 0:
+            if needed > 0.1:
                 for n, v in portfolio.items():
                     if 'bitcoin' in n.lower() and v > 0:
                         gross = needed / 0.85
@@ -198,28 +203,28 @@ def run_simulation(params: SimParams):
                         portfolio[n] -= take
                         inc_tracker["bitcoin_withdrawals"] += take
                         needed -= (take * 0.85)
-                        if needed <= 0: break
+                        if needed <= 0.1: break
 
             # 3. 401k/IRA
-            if needed > 0 and age >= params.retirement_withdrawal_age:
+            if needed > 0.1 and age >= params.retirement_withdrawal_age:
                  for n, v in portfolio.items():
                     if asset_types[n] == 'pre_tax' and v > 0:
-                        gross = needed / 0.75 # Assume 25% tax for withdrawal logic
+                        gross = needed / 0.75 
                         take = min(gross, v)
                         portfolio[n] -= take
                         inc_tracker["retirement_withdrawals"] += take
                         taxable_income += take
                         needed -= (take * 0.75)
-                        if needed <= 0: break
+                        if needed <= 0.1: break
             
             # 4. Rental Equity
-            if needed > 0:
+            if needed > 0.1:
                 for n, v in portfolio.items():
                     if asset_types[n] == 'real_estate' and 'primary' not in n.lower() and v > 0:
                         gross = needed / 0.85
                         take = min(gross, v)
                         
-                        pre_sale_value = v + take # Corrected logic to determine pre-sale base
+                        pre_sale_value = v + take 
                         portfolio[n] -= take
                         if pre_sale_value > 0:
                             pct_sold = take / pre_sale_value
@@ -227,17 +232,21 @@ def run_simulation(params: SimParams):
                         
                         inc_tracker["brokerage_withdrawals"] += take 
                         needed -= (take * 0.85)
-                        if needed <= 0: break
+                        if needed <= 0.1: break
 
             # 5. Roth
-            if needed > 0:
+            if needed > 0.1:
                 for n, v in portfolio.items():
                     if asset_types[n] == 'roth' and v > 0:
                         take = min(needed, v)
                         portfolio[n] -= take
                         inc_tracker["roth_withdrawals"] += take
                         needed -= take
-                        if needed <= 0: break
+                        if needed <= 0.1: break
+            
+            # If we reduced 'needed' to effectively 0, we are fully funded
+            if needed <= 1.0: # Allow $1 tolerance
+                fully_funded = True
         
         # 6. RE-CALCULATE TAXES (Final)
         final_tax = calculate_federal_tax(taxable_income, years_passed=years_passed, inflation=params.general_inflation)
@@ -257,9 +266,9 @@ def run_simulation(params: SimParams):
         }
         
         # *** NORMALIZATION FIX ***
-        # If we are in a deficit (meaning we withdrew assets to cover expenses),
-        # force the visual bars to stack up exactly to the expense line.
-        if surplus < 0:
+        # Only normalize if we are SOLVENT (fully funded).
+        # If we ran out of money (needed > 1.0), do NOT normalize. Let the gap show.
+        if surplus < 0 and fully_funded:
             current_total = sum(after_tax.values())
             if current_total > 0:
                 correction_ratio = target_expenses / current_total
