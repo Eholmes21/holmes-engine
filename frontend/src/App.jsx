@@ -501,128 +501,126 @@ export default function App() {
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
-              {/* One-Time Asset Additions */}
-              <div className={cardClass}>
-                <h3 className="text-lg font-semibold flex items-center gap-2 text-slate-300 mb-3">
-                  <Plus size={20}/> One-Time Asset Additions
-                </h3>
-                <div className="space-y-2">
-                  {otherAssets.map((asset, i) => (
-                    <div key={i} className="grid grid-cols-3 gap-2">
-                      <div>
-                        <label className="text-xs text-slate-500">Name</label>
-                        <input 
-                          value={asset.name} 
-                          onChange={e => {
-                            const updated = [...otherAssets];
-                            updated[i].name = e.target.value;
-                            setOtherAssets(updated);
-                          }}
-                          className={inputClass}
-                        />
-                      </div>
-                      <div>
-                        <label className="text-xs text-slate-500">Value $</label>
-                        <input 
-                          type="number" 
-                          value={asset.value} 
-                          onChange={e => {
-                            const updated = [...otherAssets];
-                            updated[i].value = Number(e.target.value);
-                            setOtherAssets(updated);
-                          }}
-                          className={inputClass}
-                        />
-                      </div>
-                      <div>
-                        <label className="text-xs text-slate-500">Year</label>
-                        <input 
-                          type="number" 
-                          value={asset.add_year} 
-                          onChange={e => {
-                            const updated = [...otherAssets];
-                            updated[i].add_year = Number(e.target.value);
-                            setOtherAssets(updated);
-                          }}
-                          className={inputClass}
-                        />
-                      </div>
+            {/* One-Time Asset Additions */}
+            <div className={cardClass}>
+              <h3 className="text-lg font-semibold flex items-center gap-2 text-slate-300 mb-3">
+                <Plus size={20}/> One-Time Asset Additions
+              </h3>
+              <div className="space-y-2">
+                {otherAssets.map((asset, i) => (
+                  <div key={i} className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label className="text-xs text-slate-500">Name</label>
+                      <input 
+                        value={asset.name} 
+                        onChange={e => {
+                          const updated = [...otherAssets];
+                          updated[i].name = e.target.value;
+                          setOtherAssets(updated);
+                        }}
+                        className={inputClass}
+                      />
                     </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* One-Time Expenses */}
-              <div className={cardClass}>
-                <h3 className="text-lg font-semibold flex items-center gap-2 text-slate-300 mb-3">
-                  <CreditCard size={20}/> One-Time Expenses
-                </h3>
-                <div className="space-y-3">
-                  {oneTimeExpenses.map((expense, i) => (
-                    <div key={i} className="bg-slate-900 p-3 rounded-lg">
-                      <div className="grid grid-cols-3 gap-2">
-                        <div>
-                          <label className="text-xs text-slate-500">Name</label>
-                          <input
-                            value={expense.name}
-                            onChange={e => {
-                              const updated = [...oneTimeExpenses];
-                              updated[i].name = e.target.value;
-                              setOneTimeExpenses(updated);
-                            }}
-                            className={inputClass}
-                          />
-                        </div>
-                        <div>
-                          <label className="text-xs text-slate-500">Amount $</label>
-                          <input
-                            type="number"
-                            value={expense.amount}
-                            onChange={e => {
-                              const updated = [...oneTimeExpenses];
-                              updated[i].amount = Number(e.target.value);
-                              setOneTimeExpenses(updated);
-                            }}
-                            className={inputClass}
-                          />
-                        </div>
-                        <div>
-                          <label className="text-xs text-slate-500">Year</label>
-                          <input
-                            type="number"
-                            value={expense.year}
-                            onChange={e => {
-                              const updated = [...oneTimeExpenses];
-                              updated[i].year = Number(e.target.value);
-                              setOneTimeExpenses(updated);
-                            }}
-                            className={inputClass}
-                          />
-                        </div>
-                      </div>
-
-                      <label className="mt-2 flex items-center gap-2 text-sm text-slate-300 select-none">
-                        <input
-                          type="checkbox"
-                          checked={!!expense.add_to_primary_home}
-                          onChange={e => {
-                            const updated = [...oneTimeExpenses];
-                            updated[i].add_to_primary_home = e.target.checked;
-                            setOneTimeExpenses(updated);
-                          }}
-                        />
-                        Vacation house (add to Primary Home)
-                      </label>
+                    <div>
+                      <label className="text-xs text-slate-500">Value $</label>
+                      <input 
+                        type="number" 
+                        value={asset.value} 
+                        onChange={e => {
+                          const updated = [...otherAssets];
+                          updated[i].value = Number(e.target.value);
+                          setOtherAssets(updated);
+                        }}
+                        className={inputClass}
+                      />
                     </div>
-                  ))}
-                </div>
+                    <div>
+                      <label className="text-xs text-slate-500">Year</label>
+                      <input 
+                        type="number" 
+                        value={asset.add_year} 
+                        onChange={e => {
+                          const updated = [...otherAssets];
+                          updated[i].add_year = Number(e.target.value);
+                          setOtherAssets(updated);
+                        }}
+                        className={inputClass}
+                      />
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
           </div>
 
           {/* Middle Column - Income & Expenses */}
           <div className="space-y-4" style={{minWidth: '500px'}}>
+            {/* One-Time Expenses */}
+            <div className={cardClass}>
+              <h3 className="text-lg font-semibold flex items-center gap-2 text-slate-300 mb-3">
+                <CreditCard size={20}/> One-Time Expenses
+              </h3>
+              <div className="space-y-3">
+                {oneTimeExpenses.map((expense, i) => (
+                  <div key={i} className="bg-slate-900 p-3 rounded-lg">
+                    <div className="grid grid-cols-3 gap-2">
+                      <div>
+                        <label className="text-xs text-slate-500">Name</label>
+                        <input
+                          value={expense.name}
+                          onChange={e => {
+                            const updated = [...oneTimeExpenses];
+                            updated[i].name = e.target.value;
+                            setOneTimeExpenses(updated);
+                          }}
+                          className={inputClass}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs text-slate-500">Amount $</label>
+                        <input
+                          type="number"
+                          value={expense.amount}
+                          onChange={e => {
+                            const updated = [...oneTimeExpenses];
+                            updated[i].amount = Number(e.target.value);
+                            setOneTimeExpenses(updated);
+                          }}
+                          className={inputClass}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs text-slate-500">Year</label>
+                        <input
+                          type="number"
+                          value={expense.year}
+                          onChange={e => {
+                            const updated = [...oneTimeExpenses];
+                            updated[i].year = Number(e.target.value);
+                            setOneTimeExpenses(updated);
+                          }}
+                          className={inputClass}
+                        />
+                      </div>
+                    </div>
+
+                    <label className="mt-2 flex items-center gap-2 text-sm text-slate-300 select-none">
+                      <input
+                        type="checkbox"
+                        checked={!!expense.add_to_primary_home}
+                        onChange={e => {
+                          const updated = [...oneTimeExpenses];
+                          updated[i].add_to_primary_home = e.target.checked;
+                          setOneTimeExpenses(updated);
+                        }}
+                      />
+                      Vacation house (add to Primary Home)
+                    </label>
+                  </div>
+                ))}
+              </div>
+            </div>
+
             {/* Income Streams */}
             <div className={cardClass}>
               <div className="flex justify-between items-center mb-3">
