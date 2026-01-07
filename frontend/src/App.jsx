@@ -547,20 +547,36 @@ export default function App() {
 
   // Format value with k/M suffix (2 decimals for tooltip)
   const formatValueDetailed = (val) => {
-    if (val >= 1000000) {
-      return `$${(val/1000000).toFixed(2)}M`;
+    if (val === undefined || val === null) return '—';
+    const n = Number(val);
+    if (!Number.isFinite(n)) return '—';
+    if (n >= 1000000) {
+      return `$${(n/1000000).toFixed(2)}M`;
     }
-    return `$${(val/1000).toFixed(0)}k`;
+    return `$${(n/1000).toFixed(0)}k`;
   };
 
   // Custom tooltip that shows both year and age
-  const CustomTooltip = ({ active, payload, label }) => {
+  const CustomTooltip = ({ active, payload, label, variant }) => {
     if (active && payload && payload.length) {
       const age = label;
       const year = 2025 + (age - currentAge);
+      const d = payload[0]?.payload;
       return (
         <div className="bg-slate-900 p-3 rounded border border-slate-700 shadow-lg">
           <p className="text-slate-300 font-semibold mb-2">{`Age ${age} (${year})`}</p>
+
+          {variant === 'netWorth' && (
+            <p className="text-sm text-slate-200">
+              {`Total Nominal Net Worth: ${formatValueDetailed(d?.nominal_net_worth)}`}
+            </p>
+          )}
+          {variant === 'expenses' && (
+            <p className="text-sm text-slate-200">
+              {`Total Nominal Expenses: ${formatValueDetailed(d?.total_expenses)}`}
+            </p>
+          )}
+
           {payload.map((entry, index) => (
             <p key={index} style={{ color: entry.color }} className="text-sm">
               {`${entry.name}: ${formatValueDetailed(entry.value)}`}
@@ -1269,7 +1285,7 @@ export default function App() {
                   <ComposedChart data={data}>
                     <XAxis dataKey="age" stroke="#64748b" tick={{fontSize: 11}}/>
                     <YAxis stroke="#64748b" tickFormatter={formatValue} tick={{fontSize: 11}}/>
-                    <Tooltip content={<CustomTooltip />} />
+                    <Tooltip content={<CustomTooltip variant="netWorth" />} />
                     <Legend wrapperStyle={{fontSize: 10}}/>
                     <Bar dataKey="retirement_traditional" stackId="assets" fill="#10b981" name="401k"/>
                     <Bar dataKey="retirement_roth" stackId="assets" fill="#3b82f6" name="Roth IRA"/>
@@ -1290,7 +1306,7 @@ export default function App() {
                   <ComposedChart data={data}>
                     <XAxis dataKey="age" stroke="#64748b" tick={{fontSize: 11}}/>
                     <YAxis stroke="#64748b" tickFormatter={formatValue} tick={{fontSize: 11}}/>
-                    <Tooltip content={<CustomTooltip />} />
+                    <Tooltip content={<CustomTooltip variant="expenses" />} />
                     <Legend wrapperStyle={{fontSize: 10}}/>
                     <Bar dataKey="w2_income_after_tax" stackId="income" fill="#9ca3af" name="W2 Salary"/>
                     <Bar dataKey="rental_income_after_tax" stackId="income" fill="#f59e0b" name="Rental Income"/>
