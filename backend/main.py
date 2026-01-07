@@ -218,11 +218,34 @@ def _simulate_timeline_with_random_returns(
                 else:
                     inc_tracker["other_income"] += amt
 
-        # B. Dividends
-        div_base = sum(v for n, v in portfolio.items() if asset_types[n] in ['taxable', 'roth'])
-        inc_tracker["dividend_income"] = div_base * 0.02
+        # B. 401k Contributions (employee + employer match)
+        # Only if there's W2 income this year
+        employee_401k_contribution = 0.0
+        employer_401k_match = 0.0
+        if inc_tracker["w2_income"] > 0:
+            # Inflation-adjusted contribution limit ($24,500 base in 2025)
+            contribution_limit = 24500.0 * ((1 + base_inflation) ** years_passed)
+            # Employee contributes up to the limit
+            employee_401k_contribution = min(inc_tracker["w2_income"], contribution_limit)
+            # Employer matches 100% up to 13% of W2 salary
+            max_employer_match = inc_tracker["w2_income"] * 0.13
+            employer_401k_match = min(employee_401k_contribution, max_employer_match)
+            # Add both to 401k
+            pretax_account = next((n for n, t in asset_types.items() if t == 'pre_tax'), None)
+            if pretax_account:
+                portfolio[pretax_account] += employee_401k_contribution + employer_401k_match
 
-        # C. RMDs
+        # C. Dividends
+        # Dividends are modeled as a cashflow from taxable brokerage stocks.
+        # Roth and 401k returns are handled via their growth_rate (i.e., dividends are effectively reinvested there).
+        div_base = sum(
+            v
+            for n, v in portfolio.items()
+            if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower()
+        )
+        inc_tracker["dividend_income"] = div_base * 0.011
+
+        # D. RMDs
         rmd_total = 0
         div = get_rmd_divisor(age)
         if div > 0:
@@ -234,8 +257,10 @@ def _simulate_timeline_with_random_returns(
         inc_tracker["retirement_withdrawals"] += rmd_total
 
         # 4. TAX CALCULATION (Initial)
+        # Subtract employee 401k contribution from taxable W2 income (pre-tax)
+        taxable_w2 = inc_tracker["w2_income"] - employee_401k_contribution
         taxable_income = (
-            inc_tracker["w2_income"] + inc_tracker["rental_income"] +
+            taxable_w2 + inc_tracker["rental_income"] +
             inc_tracker["royalty_income"] + inc_tracker["dividend_income"] +
             inc_tracker["social_security"] + inc_tracker["retirement_withdrawals"] +
             inc_tracker["other_income"]
@@ -260,6 +285,20 @@ def _simulate_timeline_with_random_returns(
         else:
             needed = abs(surplus)
 
+            # If we've reached the configured withdrawal age, prefer tapping pre-tax
+            # retirement accounts first (instead of waiting until other sources are exhausted).
+            if needed > 0.1 and age >= params.retirement_withdrawal_age:
+                for n, v in portfolio.items():
+                    if asset_types[n] == 'pre_tax' and v > 0:
+                        gross = needed / 0.75
+                        take = min(gross, v)
+                        portfolio[n] -= take
+                        inc_tracker["retirement_withdrawals"] += take
+                        taxable_income += take
+                        needed -= (take * 0.75)
+                        if needed <= 0.1:
+                            break
+
             # 1. Brokerage Stocks
             if needed > 0:
                 for n, v in portfolio.items():
@@ -281,19 +320,6 @@ def _simulate_timeline_with_random_returns(
                         portfolio[n] -= take
                         inc_tracker["bitcoin_withdrawals"] += take
                         needed -= (take * 0.85)
-                        if needed <= 0.1:
-                            break
-
-            # 3. 401k/IRA
-            if needed > 0.1 and age >= params.retirement_withdrawal_age:
-                for n, v in portfolio.items():
-                    if asset_types[n] == 'pre_tax' and v > 0:
-                        gross = needed / 0.75
-                        take = min(gross, v)
-                        portfolio[n] -= take
-                        inc_tracker["retirement_withdrawals"] += take
-                        taxable_income += take
-                        needed -= (take * 0.75)
                         if needed <= 0.1:
                             break
 
@@ -588,11 +614,34 @@ def run_simulation(params: SimParams):
                 elif "social" in nl: inc_tracker["social_security"] += amt
                 else: inc_tracker["other_income"] += amt
 
+        # B. 401k Contributions (employee + employer match)
+        # Only if there's W2 income this year
+        employee_401k_contribution = 0.0
+        employer_401k_match = 0.0
+        if inc_tracker["w2_income"] > 0:
+            # Inflation-adjusted contribution limit ($24,500 base in 2025)
+            contribution_limit = 24500.0 * ((1 + params.general_inflation) ** years_passed)
+            # Employee contributes up to the limit
+            employee_401k_contribution = min(inc_tracker["w2_income"], contribution_limit)
+            # Employer matches 100% up to 13% of W2 salary
+            max_employer_match = inc_tracker["w2_income"] * 0.13
+            employer_401k_match = min(employee_401k_contribution, max_employer_match)
+            # Add both to 401k
+            pretax_account = next((n for n, t in asset_types.items() if t == 'pre_tax'), None)
+            if pretax_account:
+                portfolio[pretax_account] += employee_401k_contribution + employer_401k_match
+
         # B. Dividends
-        div_base = sum(v for n, v in portfolio.items() if asset_types[n] in ['taxable', 'roth'])
-        inc_tracker["dividend_income"] = div_base * 0.02
+        # Dividends are modeled as a cashflow from taxable brokerage stocks.
+        # Roth and 401k returns are handled via their growth_rate (i.e., dividends are effectively reinvested there).
+        div_base = sum(
+            v
+            for n, v in portfolio.items()
+            if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower()
+        )
+        inc_tracker["dividend_income"] = div_base * 0.011
         
-        # C. RMDs
+        # D. RMDs
         rmd_total = 0
         div = get_rmd_divisor(age)
         if div > 0:
@@ -604,7 +653,9 @@ def run_simulation(params: SimParams):
         inc_tracker["retirement_withdrawals"] += rmd_total
 
         # 4. TAX CALCULATION (Initial)
-        taxable_income = (inc_tracker["w2_income"] + inc_tracker["rental_income"] + 
+        # Subtract employee 401k contribution from taxable W2 income (pre-tax)
+        taxable_w2 = inc_tracker["w2_income"] - employee_401k_contribution
+        taxable_income = (taxable_w2 + inc_tracker["rental_income"] + 
                           inc_tracker["royalty_income"] + inc_tracker["dividend_income"] + 
                           inc_tracker["social_security"] + inc_tracker["retirement_withdrawals"] + 
                           inc_tracker["other_income"])
@@ -636,6 +687,20 @@ def run_simulation(params: SimParams):
         else:
             # DEFICIT
             needed = abs(surplus)
+
+            # If we've reached the configured withdrawal age, prefer tapping pre-tax
+            # retirement accounts first (instead of waiting until other sources are exhausted).
+            if needed > 0.1 and age >= params.retirement_withdrawal_age:
+                for n, v in portfolio.items():
+                    if asset_types[n] == 'pre_tax' and v > 0:
+                        gross = needed / 0.75
+                        take = min(gross, v)
+                        portfolio[n] -= take
+                        inc_tracker["retirement_withdrawals"] += take
+                        taxable_income += take
+                        needed -= (take * 0.75)
+                        if needed <= 0.1:
+                            break
             
             # 1. Brokerage Stocks
             if needed > 0:
@@ -657,18 +722,6 @@ def run_simulation(params: SimParams):
                         portfolio[n] -= take
                         inc_tracker["bitcoin_withdrawals"] += take
                         needed -= (take * 0.85)
-                        if needed <= 0.1: break
-
-            # 3. 401k/IRA
-            if needed > 0.1 and age >= params.retirement_withdrawal_age:
-                 for n, v in portfolio.items():
-                    if asset_types[n] == 'pre_tax' and v > 0:
-                        gross = needed / 0.75 
-                        take = min(gross, v)
-                        portfolio[n] -= take
-                        inc_tracker["retirement_withdrawals"] += take
-                        taxable_income += take
-                        needed -= (take * 0.75)
                         if needed <= 0.1: break
             
             # 4. Rental Equity

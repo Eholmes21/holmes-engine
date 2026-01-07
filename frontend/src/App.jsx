@@ -32,7 +32,7 @@ const DEFAULT_ONE_TIME_EXPENSES = [
   { name: "One-Time Expense 1", amount: 0, year: 2030, add_to_primary_home: false },
   { name: "One-Time Expense 2", amount: 0, year: 2035, add_to_primary_home: false }
 ];
-const DEFAULT_RATES = { inflation: 3.5, stockGrowth: 5, realEstateGrowth: 2.0, retireAge: 48 };
+const DEFAULT_RATES = { inflation: 3.5, stockGrowth: 6, realEstateGrowth: 2.0, retireAge: 50 };
 
 // Randomize helper
 const randomFactor = (pct) => 1 + (Math.random() * 2 - 1) * pct;
@@ -74,6 +74,10 @@ export default function App() {
   const [stockGrowth, setStockGrowth] = useState(() => randomizeRate(DEFAULT_RATES.stockGrowth));
   const [realEstateGrowth, setRealEstateGrowth] = useState(() => randomizeRate(DEFAULT_RATES.realEstateGrowth));
   const [retirementWithdrawalAge, setRetirementWithdrawalAge] = useState(60);
+
+  // Matches backend dividend assumption (2% dividend yield from taxable brokerage stocks).
+  // We treat the Stock Growth % input as price/appreciation; pre-tax 401k and Roth get price + dividend (reinvested).
+  const DIVIDEND_YIELD_PCT = 2.0;
 
   // Assets - start randomized
   const [assets, setAssets] = useState(getRandomizedAssets);
@@ -190,7 +194,14 @@ export default function App() {
   useEffect(() => {
     setAssets(prev => prev.map(a => ({
       ...a,
-      growth_rate: a.tax_treatment === 'real_estate' ? realEstateGrowth : stockGrowth
+      growth_rate:
+        a.tax_treatment === 'real_estate'
+          ? realEstateGrowth
+          : (a.name?.toLowerCase?.().includes('bitcoin')
+              ? a.growth_rate
+              : ((a.tax_treatment === 'pre_tax' || a.tax_treatment === 'roth')
+                  ? (stockGrowth + DIVIDEND_YIELD_PCT)
+                  : stockGrowth))
     })));
   }, [stockGrowth, realEstateGrowth]);
 
@@ -981,7 +992,7 @@ export default function App() {
                 </div>
                 <div>
                   <label className={labelClass}>401k Withdrawal Age</label>
-                  <input type="number" min="59" max="73" value={retirementWithdrawalAge} onChange={e => setRetirementWithdrawalAge(Number(e.target.value))} className={inputClass}/>
+                  <input type="number" min="0" max="95" value={retirementWithdrawalAge} onChange={e => setRetirementWithdrawalAge(Number(e.target.value))} className={inputClass}/>
                 </div>
                 <div>
                   <label className={labelClass}>Inflation %</label>

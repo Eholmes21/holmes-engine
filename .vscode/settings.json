@@ -1,6 +1,19 @@
 {
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
-  "python.analysis.extraPaths": [
-    "${workspaceFolder}/backend"
-  ]
+    "security.workspace.trust.untrustedFiles": "open",
+    "python.defaultInterpreterPath": "C:\\Users\\eholmes1\\python.exe",
+    "github.copilot.preferredAccount": "Eric-Holmes_ovintiv",
+    "interactiveWindow.executeWithShiftEnter": true,
+    "workbench.colorTheme": "Visual Studio Dark",
+    "r.rterm.windows": "C:/Users/eholmes1/AppData/Local/Programs/R/R-4.2.1/bin/R.exe",
+    "r.rpath.windows": "C:/Users/eholmes1/AppData/Local/Programs/R/R-4.2.1",
+    "r.alwaysUseActiveTerminal": true,
+    "git.path": "C:/Users/eholmes1/Git/bin/git.exe",
+    "github.copilot.nextEditSuggestions.enabled": true,
+    "github.copilot.chat.agent.autoApprove": true,
+    "chat.tools.global.autoApprove": true,
+    "chat.tools.terminal.autoApprove": true,
+   
+    "chat.tools.urls.autoApprove": {
+       
+    }
 }
