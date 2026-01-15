@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ComposedChart, Bar, Line, Legend } from 'recharts';
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ComposedChart, Bar, Line, Legend, ReferenceLine } from 'recharts';
 import { Settings, TrendingUp, DollarSign, Activity, Home, Briefcase, PiggyBank, CreditCard, Plus, Trash2, BarChart3, Sliders } from 'lucide-react';
 
 // Hidden default values - restored via Konami code
@@ -55,7 +55,7 @@ export default function App() {
   const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 
   // Navigation state
-  const [activeTab, setActiveTab] = useState('main'); // 'main' | 'monteCarlo'
+  const [activeTab, setActiveTab] = useState('main'); // 'main' | 'monteCarlo' | 'runInspector'
 
   // Monte Carlo state
   const [mcSettings, setMcSettings] = useState({
@@ -67,6 +67,12 @@ export default function App() {
   const [mcResults, setMcResults] = useState(null);
   const [mcRunning, setMcRunning] = useState(false);
 
+  // Monte Carlo run inspector state
+  const [inspectRunIndex, setInspectRunIndex] = useState(0);
+  const [inspectRun, setInspectRun] = useState(null);
+  const [inspectRunning, setInspectRunning] = useState(false);
+  const [inspectError, setInspectError] = useState(null);
+
   // Core assumptions - start randomized
   const [currentAge, setCurrentAge] = useState(38);
   const [retireAge, setRetireAge] = useState(() => Math.round(DEFAULT_RATES.retireAge * randomFactor(0.1)));
@@ -74,6 +80,10 @@ export default function App() {
   const [stockGrowth, setStockGrowth] = useState(() => randomizeRate(DEFAULT_RATES.stockGrowth));
   const [realEstateGrowth, setRealEstateGrowth] = useState(() => randomizeRate(DEFAULT_RATES.realEstateGrowth));
   const [retirementWithdrawalAge, setRetirementWithdrawalAge] = useState(60);
+
+  // Cash sleeve (starts at retirement)
+  const [cashSleevePct, setCashSleevePct] = useState(0);
+  const [cashSleeveTaperYears, setCashSleeveTaperYears] = useState(0);
 
   // Matches backend dividend assumption (2% dividend yield from taxable brokerage stocks).
   // We treat the Stock Growth % input as price/appreciation; pre-tax 401k and Roth get price + dividend (reinvested).
@@ -161,7 +171,9 @@ export default function App() {
             inflows: apiInflows,
             outflows: apiOutflows,
             other_assets: otherAssets,
-            one_time_expenses: oneTimeExpenses
+            one_time_expenses: oneTimeExpenses,
+            cash_sleeve_pct: cashSleevePct / 100,
+            cash_sleeve_taper_years: cashSleeveTaperYears,
           })
         });
 
@@ -188,7 +200,7 @@ export default function App() {
       }
     };
     runSim();
-  }, [API_URL, currentAge, retireAge, inflation, stockGrowth, realEstateGrowth, retirementWithdrawalAge, assets, inflows, outflows, otherAssets, oneTimeExpenses]);
+  }, [API_URL, currentAge, retireAge, inflation, stockGrowth, realEstateGrowth, retirementWithdrawalAge, cashSleevePct, cashSleeveTaperYears, assets, inflows, outflows, otherAssets, oneTimeExpenses]);
 
   // Update asset growth rates when global rates change
   useEffect(() => {
@@ -263,27 +275,34 @@ export default function App() {
         growth_rate: inflation / 100
       }));
 
+      const seed = Math.floor(Math.random() * 2 ** 31);
+
+      const requestBody = {
+        params: {
+          current_year: 2025,
+          current_age: currentAge,
+          target_retirement_age: retireAge,
+          retirement_withdrawal_age: retirementWithdrawalAge,
+          general_inflation: inflation / 100,
+          assets: apiAssets,
+          inflows: apiInflows,
+          outflows: apiOutflows,
+          other_assets: otherAssets,
+          one_time_expenses: oneTimeExpenses,
+          cash_sleeve_pct: cashSleevePct / 100,
+          cash_sleeve_taper_years: cashSleeveTaperYears,
+        },
+        num_runs: mcSettings.numRuns,
+        stock_volatility: mcSettings.stockVolatility / 100,
+        real_estate_volatility: mcSettings.realEstateVolatility / 100,
+        inflation_volatility: mcSettings.inflationVolatility / 100,
+        seed,
+      };
+
       const res = await fetch(`${API_URL}/monte_carlo`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          params: {
-            current_year: 2025,
-            current_age: currentAge,
-            target_retirement_age: retireAge,
-            retirement_withdrawal_age: retirementWithdrawalAge,
-            general_inflation: inflation / 100,
-            assets: apiAssets,
-            inflows: apiInflows,
-            outflows: apiOutflows,
-            other_assets: otherAssets,
-            one_time_expenses: oneTimeExpenses,
-          },
-          num_runs: mcSettings.numRuns,
-          stock_volatility: mcSettings.stockVolatility / 100,
-          real_estate_volatility: mcSettings.realEstateVolatility / 100,
-          inflation_volatility: mcSettings.inflationVolatility / 100,
-        })
+        body: JSON.stringify(requestBody)
       });
 
       if (!res.ok) {
@@ -301,13 +320,105 @@ export default function App() {
         stockReturnBoxData: result.stockReturnBoxData || [],
         successRate: result.successRate,
         numRuns: result.numRuns,
+        seed,
+        request: requestBody,
       });
+
+      setInspectRunIndex(0);
+      setInspectRun(null);
+      setInspectError(null);
     } catch (err) {
       console.error('Monte Carlo error:', err);
     } finally {
       setMcRunning(false);
     }
   };
+
+  const fetchInspectRun = useCallback(async () => {
+    if (!mcResults?.request) return;
+
+    setInspectRunning(true);
+    setInspectError(null);
+
+    try {
+      const numRuns = Number(mcResults.request?.num_runs || mcResults.numRuns || 1);
+      const idx = Math.max(0, Math.min(numRuns - 1, Number(inspectRunIndex) || 0));
+
+      const res = await fetch(`${API_URL}/monte_carlo_run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          params: mcResults.request.params,
+          run_index: idx,
+          num_runs: mcResults.request.num_runs,
+          stock_volatility: mcResults.request.stock_volatility,
+          real_estate_volatility: mcResults.request.real_estate_volatility,
+          inflation_volatility: mcResults.request.inflation_volatility,
+          seed: mcResults.request.seed,
+        })
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Run API ${res.status} ${res.statusText}: ${text || '(no body)'}`);
+      }
+
+      const result = await res.json();
+      if (!result?.timeline) {
+        throw new Error('Run response missing timeline');
+      }
+
+      setInspectRun(result);
+    } catch (err) {
+      setInspectRun(null);
+      setInspectError(err?.message || String(err));
+    } finally {
+      setInspectRunning(false);
+    }
+  }, [API_URL, inspectRunIndex, mcResults]);
+
+  useEffect(() => {
+    if (activeTab !== 'runInspector') return;
+    if (!mcResults?.request) return;
+    fetchInspectRun();
+  }, [activeTab, mcResults, inspectRunIndex, fetchInspectRun]);
+
+  const inspectNetIncomeSeries = useMemo(() => {
+    const tl = inspectRun?.timeline;
+    if (!Array.isArray(tl)) return [];
+
+    return tl.map((row) => {
+      const totalIncomeAfterTax = Object.entries(row).reduce((sum, [k, v]) => {
+        if (k.endsWith('_after_tax') && !k.toLowerCase().includes('withdrawal')) {
+          return sum + (Number(v) || 0);
+        }
+        return sum;
+      }, 0);
+
+      const totalExpenses = Number(row?.total_expenses) || 0;
+      return {
+        age: row?.age,
+        year: row?.year,
+        net_income: totalIncomeAfterTax - totalExpenses,
+      };
+    });
+  }, [inspectRun]);
+
+  const inspectStockReturnAvg = useMemo(() => {
+    const series = inspectRun?.stockReturnSeries;
+    if (!Array.isArray(series) || series.length === 0) return null;
+    let sum = 0;
+    let n = 0;
+    for (const row of series) {
+      const v = Number(row?.stock_return);
+      if (Number.isFinite(v)) {
+        sum += v;
+        n += 1;
+      }
+    }
+    if (n === 0) return null;
+    return sum / n;
+  }, [inspectRun]);
 
   const updateAsset = (index, field, value) => {
     setAssets(prev => prev.map((a, i) => i === index ? { ...a, [field]: value } : a));
@@ -588,6 +699,153 @@ export default function App() {
     return null;
   };
 
+  const RunInspectorMoneyTooltip = ({ active, payload }) => {
+    if (active && payload && payload.length) {
+      const d = payload[0]?.payload;
+      return (
+        <div className="bg-slate-900 p-3 rounded border border-slate-700 shadow-lg">
+          <p className="text-slate-300 font-semibold mb-2">{`Age ${d?.age} (${d?.year})`}</p>
+          {payload.map((entry, index) => (
+            <p key={index} style={{ color: entry.color }} className="text-sm">
+              {`${entry.name}: ${formatValueDetailed(entry.value)}`}
+            </p>
+          ))}
+        </div>
+      );
+    }
+    return null;
+  };
+
+  const RunInspectorStockTooltip = ({ active, payload }) => {
+    if (active && payload && payload.length) {
+      const d = payload[0]?.payload;
+      const v = Number(payload[0]?.value);
+      return (
+        <div className="bg-slate-900 p-3 rounded border border-slate-700 shadow-lg">
+          <p className="text-slate-300 font-semibold mb-2">{`Age ${d?.age} (${d?.year})`}</p>
+          <p className="text-sm text-slate-200">{`Stock Return: ${Number.isFinite(v) ? fmtPctSigned(v) : '—'}`}</p>
+        </div>
+      );
+    }
+    return null;
+  };
+
+  const ExpensesByYearTooltip = ({ active, payload, label }) => {
+    if (active && payload && payload.length) {
+      const year = Number(label);
+      const age = currentAge + (year - 2025);
+      const d = payload[0]?.payload;
+
+      return (
+        <div className="bg-slate-900 p-3 rounded border border-slate-700 shadow-lg">
+          <p className="text-slate-300 font-semibold mb-2">{`Year ${year} (Age ${age})`}</p>
+          <p className="text-sm text-slate-200">
+            {`Total Nominal Expenses: ${formatValueDetailed(d?.total_expenses)}`}
+          </p>
+          {payload
+            .filter(e => e?.value && Number(e.value) !== 0)
+            .map((entry, index) => (
+              <p key={index} style={{ color: entry.color }} className="text-sm">
+                {`${entry.name}: ${formatValueDetailed(entry.value)}`}
+              </p>
+            ))}
+        </div>
+      );
+    }
+    return null;
+  };
+
+  const EXPENSE_STACK_COLORS = [
+    '#ef4444', // red
+    '#f59e0b', // amber
+    '#10b981', // emerald
+    '#3b82f6', // blue
+    '#8b5cf6', // purple
+    '#f97316', // orange
+    '#06b6d4', // cyan
+    '#9ca3af', // gray
+    '#ec4899', // pink
+    '#facc15', // yellow
+  ];
+
+  const expenseSeries = useMemo(() => {
+    const used = new Set();
+    const baseKey = (name) => {
+      const s = String(name ?? '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+      return s || 'expense';
+    };
+    const uniqueKey = (k) => {
+      let key = k;
+      let i = 2;
+      while (used.has(key)) {
+        key = `${k}_${i}`;
+        i += 1;
+      }
+      used.add(key);
+      return key;
+    };
+
+    const series = outflows.map((o, idx) => ({
+      kind: 'outflow',
+      key: uniqueKey(baseKey(o?.name) || `expense_${idx + 1}`),
+      name: o?.name || `Expense ${idx + 1}`,
+      fill: EXPENSE_STACK_COLORS[idx % EXPENSE_STACK_COLORS.length],
+      outflow: o,
+    }));
+
+    const includeOneTime = oneTimeExpenses?.some(e => Number(e?.amount) > 0);
+    if (includeOneTime) {
+      series.push({
+        kind: 'oneTime',
+        key: uniqueKey('one_time_expenses'),
+        name: 'One-Time Expenses',
+        fill: EXPENSE_STACK_COLORS[series.length % EXPENSE_STACK_COLORS.length],
+      });
+    }
+
+    return series;
+  }, [outflows, oneTimeExpenses]);
+
+  const expensesByYearData = useMemo(() => {
+    if (!data || !Array.isArray(data)) return [];
+    const baseYear = 2025;
+
+    return data.map((pt) => {
+      const year = Number(pt?.year);
+      const yearsPassed = year - baseYear;
+      const row = { year, age: pt?.age };
+      let total = 0;
+
+      for (const s of expenseSeries) {
+        let v = 0;
+        if (s.kind === 'outflow') {
+          const o = s.outflow;
+          const start = Number(o?.start_year);
+          const end = Number(o?.end_year);
+          if (Number.isFinite(year) && year >= start && year <= end) {
+            const ratePct = (o?.growth_rate ?? inflation);
+            const r = Number(ratePct) / 100;
+            v = Number(o?.amount) * Math.pow(1 + r, yearsPassed);
+          }
+        } else if (s.kind === 'oneTime') {
+          v = (oneTimeExpenses || [])
+            .filter(e => Number(e?.year) === year)
+            .reduce((sum, e) => sum + Number(e?.amount || 0), 0);
+        }
+
+        const rounded = Number.isFinite(v) ? Math.round(v) : 0;
+        row[s.key] = rounded;
+        total += rounded;
+      }
+
+      row.total_expenses = Math.round(total);
+      return row;
+    });
+  }, [data, expenseSeries, inflation, oneTimeExpenses]);
+
   const formatPctAxis = (val) => {
     if (val === undefined || val === null) return '';
     const v = Number(val);
@@ -814,6 +1072,13 @@ export default function App() {
         >
           <Sliders size={24}/>
         </button>
+        <button
+          onClick={() => setActiveTab('runInspector')}
+          className={`p-3 rounded-lg transition-colors ${activeTab === 'runInspector' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:bg-slate-700 hover:text-white'}`}
+          title="Run Inspector"
+        >
+          <Activity size={24}/>
+        </button>
       </div>
 
       {/* Main Content Area */}
@@ -950,6 +1215,130 @@ export default function App() {
           </div>
         )}
 
+        {/* Run Inspector Tab */}
+        {activeTab === 'runInspector' && (
+          <div className="w-full px-6 py-6">
+            <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
+              <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
+                <Activity size={24}/> Run Inspector
+              </h2>
+
+              {!mcResults?.request && (
+                <div className="bg-slate-900 p-4 rounded-lg border border-slate-700 text-slate-200">
+                  Run Monte Carlo first, then come back here to inspect an individual run.
+                </div>
+              )}
+
+              {mcResults?.request && (
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                    <div>
+                      <label className={labelClass}>Run Index</label>
+                      <input
+                        type="number"
+                        min="0"
+                        max={Math.max(0, Number(mcResults.request.num_runs || 1) - 1)}
+                        value={inspectRunIndex}
+                        onChange={e => setInspectRunIndex(Number(e.target.value))}
+                        className={inputClass}
+                      />
+                      <p className="text-xs text-slate-500 mt-1">Seed: {mcResults.request.seed}</p>
+                    </div>
+
+                    <div>
+                      <label className={labelClass}>Status</label>
+                      <div className="bg-slate-900 p-3 rounded-lg border border-slate-700">
+                        {inspectRunning ? (
+                          <p className="text-slate-300">Loading…</p>
+                        ) : inspectRun?.isSuccess === true ? (
+                          <p className="text-emerald-400 font-semibold">Success (no shortfall before 95)</p>
+                        ) : inspectRun?.isSuccess === false ? (
+                          <>
+                            <p className="text-red-300 font-semibold">Failed (shortfall before 95)</p>
+                            {inspectRun?.firstFailureYear != null && (
+                              <p className="text-slate-300 text-sm mt-1">First shortfall year: {inspectRun.firstFailureYear}</p>
+                            )}
+                          </>
+                        ) : (
+                          <p className="text-slate-400">—</p>
+                        )}
+                        {inspectError && <p className="text-red-300 text-sm mt-2 whitespace-pre-wrap">{inspectError}</p>}
+                      </div>
+                    </div>
+
+                    <div className="flex items-end">
+                      <button
+                        onClick={fetchInspectRun}
+                        disabled={inspectRunning}
+                        className={`w-full px-4 py-3 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2 ${inspectRunning ? 'bg-slate-600 cursor-not-allowed' : 'bg-emerald-600 hover:bg-emerald-500'}`}
+                      >
+                        <BarChart3 size={18}/>
+                        {inspectRunning ? 'Loading Run...' : 'Load Run'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {inspectRun?.timeline && (
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                      <div className="bg-slate-900 p-4 rounded-xl border border-slate-700 h-[360px]">
+                        <h3 className="text-lg font-semibold mb-2">Stock Market Return by Year</h3>
+                        <ResponsiveContainer width="100%" height="90%">
+                          <ComposedChart data={inspectRun.stockReturnSeries || []}>
+                            <XAxis dataKey="age" tick={{ fill: '#94a3b8', fontSize: 12 }} />
+                            <YAxis tick={{ fill: '#94a3b8', fontSize: 12 }} tickFormatter={formatPctAxis} />
+                            <Tooltip content={<RunInspectorStockTooltip />} />
+                            {inspectStockReturnAvg != null && (
+                              <ReferenceLine
+                                y={inspectStockReturnAvg}
+                                stroke="#f59e0b"
+                                strokeDasharray="5 5"
+                                ifOverflow="extendDomain"
+                                label={{ value: `Avg ${(inspectStockReturnAvg * 100).toFixed(1)}%`, position: 'insideTopRight', fill: '#f59e0b', fontSize: 12 }}
+                              />
+                            )}
+                            <Line type="monotone" dataKey="stock_return" name="Stock Return" stroke="#10b981" strokeWidth={2} dot={false} />
+                          </ComposedChart>
+                        </ResponsiveContainer>
+                      </div>
+
+                      <div className="bg-slate-900 p-4 rounded-xl border border-slate-700 h-[360px]">
+                        <h3 className="text-lg font-semibold mb-2">Nominal Net Worth Breakdown</h3>
+                        <ResponsiveContainer width="100%" height="90%">
+                          <ComposedChart data={inspectRun.timeline || []}>
+                            <XAxis dataKey="age" tick={{ fill: '#94a3b8', fontSize: 12 }} />
+                            <YAxis tick={{ fill: '#94a3b8', fontSize: 12 }} tickFormatter={formatValue} />
+                            <Tooltip content={<RunInspectorMoneyTooltip />} />
+                            <Legend wrapperStyle={{fontSize: 10}}/>
+                            <Bar dataKey="retirement_traditional" stackId="assets" fill="#10b981" name="401k"/>
+                            <Bar dataKey="retirement_roth" stackId="assets" fill="#3b82f6" name="Roth IRA"/>
+                            <Bar dataKey="brokerage" stackId="assets" fill="#8b5cf6" name="Brokerage"/>
+                            <Bar dataKey="bitcoin" stackId="assets" fill="#f97316" name="Bitcoin"/>
+                            <Bar dataKey="cash_sleeve" stackId="assets" fill="#9ca3af" name="Cash Sleeve"/>
+                            <Bar dataKey="rental_properties" stackId="assets" fill="#f59e0b" name="Rental Properties"/>
+                            <Bar dataKey="primary_home" stackId="assets" fill="#06b6d4" name="Primary Home"/>
+                          </ComposedChart>
+                        </ResponsiveContainer>
+                      </div>
+
+                      <div className="bg-slate-900 p-4 rounded-xl border border-slate-700 h-[360px] lg:col-span-2">
+                        <h3 className="text-lg font-semibold mb-2">Net Income Through Time (After-Tax Income − Expenses)</h3>
+                        <ResponsiveContainer width="100%" height="90%">
+                          <ComposedChart data={inspectNetIncomeSeries}>
+                            <XAxis dataKey="age" tick={{ fill: '#94a3b8', fontSize: 12 }} />
+                            <YAxis tick={{ fill: '#94a3b8', fontSize: 12 }} tickFormatter={formatValue} />
+                            <Tooltip content={<RunInspectorMoneyTooltip />} />
+                            <Line type="monotone" dataKey="net_income" name="Net Income" stroke="#f59e0b" strokeWidth={2} dot={false} />
+                          </ComposedChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Main Dashboard Tab */}
         {activeTab === 'main' && (
         <div className="max-w-7xl mx-auto p-6">
@@ -1021,6 +1410,40 @@ export default function App() {
                 <div>
                   <label className={labelClass}>RE Appreciation %</label>
                   <input type="number" step="0.1" value={realEstateGrowth} onChange={e => setRealEstateGrowth(Number(e.target.value))} className={inputClass}/>
+                </div>
+              </div>
+            </div>
+
+            {/* Cash Sleeve */}
+            <div className={cardClass}>
+              <h3 className="text-lg font-semibold flex items-center gap-2 text-slate-300 mb-4">
+                <DollarSign size={20}/> Cash Sleeve (Starts at Retirement)
+              </h3>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className={labelClass}>Cash Sleeve % of Liquid (Brokerage + BTC)</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    max="100"
+                    value={cashSleevePct}
+                    onChange={e => setCashSleevePct(Math.max(0, Math.min(100, Number(e.target.value))))}
+                    className={inputClass}
+                  />
+                  <p className="text-xs text-slate-500 mt-1">Swept once at retirement (after-tax), then held in cash.</p>
+                </div>
+                <div>
+                  <label className={labelClass}>Taper to Zero (Years)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="50"
+                    value={cashSleeveTaperYears}
+                    onChange={e => setCashSleeveTaperYears(Math.max(0, Number(e.target.value)))}
+                    className={inputClass}
+                  />
+                  <p className="text-xs text-slate-500 mt-1">Linear reinvest into Brokerage (untaxed). Cash grows at inflation.</p>
                 </div>
               </div>
             </div>
@@ -1291,6 +1714,7 @@ export default function App() {
                     <Bar dataKey="retirement_roth" stackId="assets" fill="#3b82f6" name="Roth IRA"/>
                     <Bar dataKey="brokerage" stackId="assets" fill="#8b5cf6" name="Brokerage"/>
                     <Bar dataKey="bitcoin" stackId="assets" fill="#f97316" name="Bitcoin"/>
+                    <Bar dataKey="cash_sleeve" stackId="assets" fill="#9ca3af" name="Cash Sleeve"/>
                     <Bar dataKey="rental_properties" stackId="assets" fill="#f59e0b" name="Rental Properties"/>
                     <Bar dataKey="primary_home" stackId="assets" fill="#06b6d4" name="Primary Home"/>
                     <Line type="monotone" dataKey="real_net_worth" stroke="#ef4444" strokeWidth={2} strokeDasharray="5 5" dot={false} name="Real Net Worth"/>
@@ -1318,6 +1742,23 @@ export default function App() {
                     <Bar dataKey="dividend_income_after_tax" stackId="income" fill="#facc15" name="Dividends"/>
                     <Bar dataKey="social_security_after_tax" stackId="income" fill="#06b6d4" name="Social Security"/>
                     <Line type="monotone" dataKey="total_expenses" stroke="#ef4444" strokeWidth={3} dot={false} name="Expenses"/>
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 h-[360px]">
+              <h3 className="text-lg font-semibold mb-2">Expenses by Year</h3>
+              <div style={{width: '100%', height: '300px'}}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={expensesByYearData}>
+                    <XAxis dataKey="year" stroke="#64748b" tick={{fontSize: 11}} interval="preserveStartEnd" />
+                    <YAxis stroke="#64748b" tickFormatter={formatValue} tick={{fontSize: 11}}/>
+                    <Tooltip content={<ExpensesByYearTooltip />} />
+                    <Legend wrapperStyle={{fontSize: 10}}/>
+                    {expenseSeries.map(s => (
+                      <Bar key={s.key} dataKey={s.key} stackId="expenses" fill={s.fill} name={s.name} />
+                    ))}
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>

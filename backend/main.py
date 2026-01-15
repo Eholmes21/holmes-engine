@@ -4,6 +4,8 @@ from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware
 import random
 import math
+from pathlib import Path
+import csv
 
 app = FastAPI()
 
@@ -52,10 +54,22 @@ class SimParams(BaseModel):
     outflows: List[Stream]
     other_assets: List[OtherAsset] = []
     one_time_expenses: List[OneTimeExpense] = []
+    cash_sleeve_pct: float = 0.0  # fraction, e.g., 0.10 = 10%
+    cash_sleeve_taper_years: int = 0
 
 
 class MonteCarloRequest(BaseModel):
     params: SimParams
+    num_runs: int = 200
+    stock_volatility: float = 0.15
+    real_estate_volatility: float = 0.08
+    inflation_volatility: float = 0.0
+    seed: Optional[int] = None
+
+
+class MonteCarloRunRequest(BaseModel):
+    params: SimParams
+    run_index: int = 0
     num_runs: int = 200
     stock_volatility: float = 0.15
     real_estate_volatility: float = 0.08
@@ -121,26 +135,103 @@ def _skewed_stock_shock(rng: random.Random, target_sigma: float) -> float:
     return x * scale
 
 
+def _load_yearly_returns_csv(path: Path) -> List[float]:
+    vals: List[float] = []
+    with path.open(newline='') as f:
+        r = csv.DictReader(f)
+        for row in r:
+            try:
+                vals.append(float(row['return']))
+            except Exception:
+                continue
+    return vals
+
+
+_HIST_STOCK_BINS_CACHE: Optional[List[tuple[float, float, float]]] = None
+
+
+def _get_historical_stock_return_bins(bin_size: float = 0.05) -> List[tuple[float, float, float]]:
+    """Return [(lo, hi, weight), ...] representing historical annual stock returns.
+
+    We bucket annual returns into 5% bands (default), compute frequency weights from history,
+    then Monte Carlo samples a bucket by weight and a uniform return within that bucket.
+
+    Data source is a local CSV generated from Stooq S&P 500 year-end closes:
+    backend/data/spx_yearly_price_returns_1940.csv
+
+    Note: This is price return (not total return)."""
+
+    global _HIST_STOCK_BINS_CACHE
+    if _HIST_STOCK_BINS_CACHE is not None:
+        return _HIST_STOCK_BINS_CACHE
+
+    data_path = Path(__file__).resolve().parent / 'data' / 'spx_yearly_price_returns_1940.csv'
+    if not data_path.exists():
+        # Fall back to the previous skewed model if the dataset isn't present.
+        _HIST_STOCK_BINS_CACHE = []
+        return _HIST_STOCK_BINS_CACHE
+
+    vals = _load_yearly_returns_csv(data_path)
+    if not vals:
+        _HIST_STOCK_BINS_CACHE = []
+        return _HIST_STOCK_BINS_CACHE
+
+    # Build integer bin index k where bucket is [k*bin_size, (k+1)*bin_size)
+    counts: dict[int, int] = {}
+    for v in vals:
+        k = math.floor(v / bin_size)
+        counts[k] = counts.get(k, 0) + 1
+
+    total = sum(counts.values())
+    bins: List[tuple[float, float, float]] = []
+    for k in sorted(counts.keys()):
+        lo = k * bin_size
+        hi = (k + 1) * bin_size
+        w = counts[k] / total if total > 0 else 0.0
+        if w > 0:
+            bins.append((float(lo), float(hi), float(w)))
+
+    # Normalize weights defensively
+    wsum = sum(w for _, _, w in bins)
+    if wsum > 0:
+        bins = [(lo, hi, w / wsum) for (lo, hi, w) in bins]
+
+    _HIST_STOCK_BINS_CACHE = bins
+    return _HIST_STOCK_BINS_CACHE
+
+
+def _sample_historical_stock_return(rng: random.Random) -> Optional[float]:
+    bins = _get_historical_stock_return_bins()
+    if not bins:
+        return None
+
+    u = rng.random()
+    acc = 0.0
+    for lo, hi, w in bins:
+        acc += w
+        if u <= acc:
+            return rng.uniform(lo, hi)
+    lo, hi, _ = bins[-1]
+    return rng.uniform(lo, hi)
+
+
 def _simulate_timeline_with_random_returns(
     params: SimParams,
     rng: random.Random,
     stock_vol: float,
     real_estate_vol: float,
     inflation_vol: float,
-) -> tuple[List[dict], bool, List[float]]:
+) -> tuple[List[dict], bool, List[float], Optional[int]]:
     # This mirrors /simulate, but applies random returns PER YEAR when growing assets.
     timeline = []
     ever_unfunded_before_95 = False
+    first_failure_year: Optional[int] = None
 
-    # "Stock return" factor (for charting): weighted mean growth rate of all non-real-estate,
-    # non-bitcoin assets, with the shared stock shock applied.
-    stock_mean_num = 0.0
-    stock_mean_den = 0.0
-    for a in params.assets:
-        if a.tax_treatment != 'real_estate' and 'bitcoin' not in a.name.lower() and a.value > 0:
-            stock_mean_num += a.value * float(a.growth_rate)
-            stock_mean_den += a.value
-    mean_stock_growth = (stock_mean_num / stock_mean_den) if stock_mean_den > 0 else 0.0
+    cash_sleeve_balance = 0.0
+    cash_sleeve_initial = 0.0
+    cash_sleeve_started = False
+    cash_sleeve_pct = max(0.0, float(params.cash_sleeve_pct or 0.0))
+    cash_sleeve_taper_years = max(0, int(params.cash_sleeve_taper_years or 0))
 
     stock_returns: List[float] = []
 
@@ -167,6 +258,46 @@ def _simulate_timeline_with_random_returns(
             inflation_for_year = max(-0.02, min(0.15, rng.gauss(base_inflation, inflation_vol)))
 
         inflation_mult = (1 + base_inflation) ** years_passed
+
+        # Grow existing cash sleeve at inflation
+        if cash_sleeve_balance > 0:
+            cash_sleeve_balance *= (1 + inflation_for_year)
+
+        # One-time sweep into cash at retirement (brokerage + bitcoin, after-tax haircut)
+        if (not cash_sleeve_started) and cash_sleeve_pct > 0 and age >= params.target_retirement_age:
+            liquid_sources = [
+                n for n, t in asset_types.items()
+                if t == 'taxable'
+            ]
+            liquid_balance = sum(portfolio.get(n, 0.0) for n in liquid_sources)
+            if liquid_balance > 0:
+                sweep_gross = liquid_balance * cash_sleeve_pct
+                for n in liquid_sources:
+                    val = portfolio.get(n, 0.0)
+                    if val <= 0:
+                        continue
+                    take = sweep_gross * (val / liquid_balance)
+                    portfolio[n] = max(0.0, val - take)
+                sweep_net = sweep_gross * 0.85
+                cash_sleeve_balance += sweep_net
+                cash_sleeve_initial = cash_sleeve_balance
+                cash_sleeve_started = True
+                cash_sleeve_start_age = age
+
+        # Linear taper from cash sleeve into brokerage (untaxed).
+        # We drain any remaining balance in the final taper year so it reaches $0 exactly.
+        if cash_sleeve_started and cash_sleeve_initial > 0 and cash_sleeve_taper_years > 0:
+            years_since_start = age - cash_sleeve_start_age
+            if years_since_start < cash_sleeve_taper_years and cash_sleeve_balance > 0:
+                remaining_years = cash_sleeve_taper_years - years_since_start
+                annual_taper = cash_sleeve_initial / cash_sleeve_taper_years
+                move = cash_sleeve_balance if remaining_years <= 1 else min(annual_taper, cash_sleeve_balance)
+                target = next((n for n, t in asset_types.items() if t == 'taxable' and 'bitcoin' not in n.lower()), None)
+                if not target:
+                    target = next((n for n, t in asset_types.items() if t == 'taxable'), None)
+                if target:
+                    portfolio[target] = portfolio.get(target, 0.0) + move
+                    cash_sleeve_balance -= move
 
         # 1. ADD ONE-TIME ASSETS
         for oa in params.other_assets:
@@ -299,6 +430,7 @@ def _simulate_timeline_with_random_returns(
                         if needed <= 0.1:
                             break
 
+
             # 1. Brokerage Stocks
             if needed > 0:
                 for n, v in portfolio.items():
@@ -322,6 +454,11 @@ def _simulate_timeline_with_random_returns(
                         needed -= (take * 0.85)
                         if needed <= 0.1:
                             break
+            # Cash sleeve (already after-tax cash)
+            if needed > 0.1 and cash_sleeve_balance > 0:
+                take = min(needed, cash_sleeve_balance)
+                cash_sleeve_balance -= take
+                needed -= take
 
             # 4. Rental Equity
             if needed > 0.1:
@@ -359,6 +496,8 @@ def _simulate_timeline_with_random_returns(
         # "Before I turn 95" => ages 0..94.
         if age < 95 and not fully_funded:
             ever_unfunded_before_95 = True
+            if first_failure_year is None:
+                first_failure_year = year
 
         # 6. RE-CALCULATE TAXES (Final)
         final_tax = calculate_federal_tax(taxable_income, years_passed=years_passed, inflation=base_inflation)
@@ -389,10 +528,11 @@ def _simulate_timeline_with_random_returns(
             "brokerage": sum(v for n, v in portfolio.items() if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower()),
             "bitcoin": sum(v for n, v in portfolio.items() if 'bitcoin' in n.lower()),
             "rental_properties": sum(v for n, v in portfolio.items() if asset_types[n] == 'real_estate' and 'primary' not in n.lower()),
-            "primary_home": sum(v for n, v in portfolio.items() if 'primary' in n.lower())
+            "primary_home": sum(v for n, v in portfolio.items() if 'primary' in n.lower()),
+            "cash_sleeve": cash_sleeve_balance,
         }
 
-        total_assets = sum(portfolio.values())
+        total_assets = sum(portfolio.values()) + cash_sleeve_balance
 
         passive_gross = (
             inc_tracker["rental_income"] + inc_tracker["dividend_income"] +
@@ -414,25 +554,41 @@ def _simulate_timeline_with_random_returns(
         })
 
         # Apply random returns for this YEAR (not fixed per run)
-        # Stocks: use a negatively-skewed distribution (rare crash years).
-        stock_shock = _skewed_stock_shock(rng, stock_vol)
+        # Stocks: sample from a historical distribution (5% buckets since 1940).
+        # No mean-shifting to the user-entered stock growth rate.
+        sampled_stock = _sample_historical_stock_return(rng)
+        if sampled_stock is None:
+            # Fallback to prior skewed model if historical data isn't available.
+            stock_shock = _skewed_stock_shock(rng, stock_vol)
+            sampled_stock = stock_shock
+
         re_shock = rng.gauss(0.0, real_estate_vol) if real_estate_vol and real_estate_vol > 0 else 0.0
 
-        # Record the realized "stock market" return for this year.
-        stock_returns.append(_clamp_return(mean_stock_growth + stock_shock))
+        # Record the realized "stock market" return for this year (for charting).
+        stock_returns.append(_clamp_return(sampled_stock))
 
         means = {a.name: a.growth_rate for a in params.assets}
         for n, v in list(portfolio.items()):
-            mean = means.get(n, 0.0)
+            mean = float(means.get(n, 0.0))
             t = asset_types.get(n, 'taxable')
-            shock = re_shock if t == 'real_estate' else stock_shock
-            realized = _clamp_return(mean + shock)
+            name_lower = n.lower()
+
+            if t == 'real_estate':
+                realized = _clamp_return(mean + re_shock)
+            elif 'bitcoin' in name_lower:
+                # Keep bitcoin as its own process around its configured mean.
+                btc_shock = rng.gauss(0.0, stock_vol) if stock_vol and stock_vol > 0 else 0.0
+                realized = _clamp_return(mean + btc_shock)
+            else:
+                # Stocks/bonds/etc: use the sampled historical stock market return.
+                realized = _clamp_return(sampled_stock)
+
             portfolio[n] = v * (1 + realized)
 
         year += 1
         age += 1
 
-    return timeline, (not ever_unfunded_before_95), stock_returns
+    return timeline, (not ever_unfunded_before_95), stock_returns, first_failure_year
 
 
 @app.post("/monte_carlo")
@@ -443,14 +599,18 @@ def monte_carlo(req: MonteCarloRequest):
     re_vol = max(0.0, float(req.real_estate_volatility))
     infl_vol = max(0.0, float(req.inflation_volatility))
 
-    rng = random.Random(req.seed) if req.seed is not None else random.Random()
+    # Use a master RNG and derive an independent per-run seed so individual runs
+    # can be reproduced (and inspected) by run_index.
+    master_rng = random.Random(req.seed) if req.seed is not None else random.Random()
 
     runs = []
     ages = None
     stock_returns_by_run = []
     success = 0
     for _ in range(num_runs):
-        tl, is_success, stock_returns = _simulate_timeline_with_random_returns(params, rng, stock_vol, re_vol, infl_vol)
+        run_seed = master_rng.getrandbits(64)
+        run_rng = random.Random(run_seed)
+        tl, is_success, stock_returns, _ = _simulate_timeline_with_random_returns(params, run_rng, stock_vol, re_vol, infl_vol)
         runs.append(tl)
         stock_returns_by_run.append(stock_returns)
         if ages is None:
@@ -505,6 +665,50 @@ def monte_carlo(req: MonteCarloRequest):
         "stockReturnBoxData": stock_return_box_data,
         "successRate": (success / len(runs)) * 100.0,
         "numRuns": len(runs),
+        "seed": req.seed,
+    }
+
+
+@app.post("/monte_carlo_run")
+def monte_carlo_run(req: MonteCarloRunRequest):
+    params = req.params
+    num_runs = max(1, min(int(req.num_runs), 1000))
+    idx = int(req.run_index)
+    if idx < 0:
+        idx = 0
+    if idx >= num_runs:
+        idx = num_runs - 1
+
+    stock_vol = max(0.0, float(req.stock_volatility))
+    re_vol = max(0.0, float(req.real_estate_volatility))
+    infl_vol = max(0.0, float(req.inflation_volatility))
+
+    master_rng = random.Random(req.seed) if req.seed is not None else random.Random()
+    run_seed = None
+    for _ in range(idx + 1):
+        run_seed = master_rng.getrandbits(64)
+    run_rng = random.Random(run_seed)
+
+    tl, is_success, stock_returns, first_failure_year = _simulate_timeline_with_random_returns(
+        params, run_rng, stock_vol, re_vol, infl_vol
+    )
+
+    stock_series = []
+    for i in range(min(len(tl), len(stock_returns))):
+        stock_series.append({
+            "age": tl[i].get("age"),
+            "year": tl[i].get("year"),
+            "stock_return": float(stock_returns[i]),
+        })
+
+    return {
+        "runIndex": idx,
+        "numRuns": num_runs,
+        "seed": req.seed,
+        "isSuccess": bool(is_success),
+        "firstFailureYear": first_failure_year,
+        "timeline": tl,
+        "stockReturnSeries": stock_series,
     }
 
 # --- HELPER: FEDERAL TAX CALCULATOR (Inflation Adjusted) ---
@@ -556,6 +760,12 @@ def run_simulation(params: SimParams):
     
     portfolio = {a.name: a.value for a in params.assets}
     asset_types = {a.name: a.tax_treatment for a in params.assets}
+
+    cash_sleeve_balance = 0.0
+    cash_sleeve_initial = 0.0
+    cash_sleeve_started = False
+    cash_sleeve_pct = max(0.0, float(params.cash_sleeve_pct or 0.0))
+    cash_sleeve_taper_years = max(0, int(params.cash_sleeve_taper_years or 0))
     
     # Track rental equity percentage
     rental_portfolio_pct = 1.0
@@ -568,6 +778,46 @@ def run_simulation(params: SimParams):
     while age <= 95:
         years_passed = year - params.current_year
         inflation_mult = (1 + params.general_inflation) ** years_passed
+
+        # Grow existing cash sleeve at inflation
+        if cash_sleeve_balance > 0:
+            cash_sleeve_balance *= (1 + params.general_inflation)
+
+        # One-time sweep into cash at retirement (brokerage + bitcoin, after-tax haircut)
+        if (not cash_sleeve_started) and cash_sleeve_pct > 0 and age >= params.target_retirement_age:
+            liquid_sources = [
+                n for n, t in asset_types.items()
+                if t == 'taxable'
+            ]
+            liquid_balance = sum(portfolio.get(n, 0.0) for n in liquid_sources)
+            if liquid_balance > 0:
+                sweep_gross = liquid_balance * cash_sleeve_pct
+                for n in liquid_sources:
+                    val = portfolio.get(n, 0.0)
+                    if val <= 0:
+                        continue
+                    take = sweep_gross * (val / liquid_balance)
+                    portfolio[n] = max(0.0, val - take)
+                sweep_net = sweep_gross * 0.85  # assume 15% tax haircut on liquidation
+                cash_sleeve_balance += sweep_net
+                cash_sleeve_initial = cash_sleeve_balance
+                cash_sleeve_started = True
+                cash_sleeve_start_age = age
+
+        # Linear taper from cash sleeve into brokerage (untaxed).
+        # Drain any remaining balance in the final taper year so it reaches $0 exactly.
+        if cash_sleeve_started and cash_sleeve_initial > 0 and cash_sleeve_taper_years > 0:
+            years_since_start = age - cash_sleeve_start_age
+            if years_since_start < cash_sleeve_taper_years and cash_sleeve_balance > 0:
+                remaining_years = cash_sleeve_taper_years - years_since_start
+                annual_taper = cash_sleeve_initial / cash_sleeve_taper_years
+                move = cash_sleeve_balance if remaining_years <= 1 else min(annual_taper, cash_sleeve_balance)
+                target = next((n for n, t in asset_types.items() if t == 'taxable' and 'bitcoin' not in n.lower()), None)
+                if not target:
+                    target = next((n for n, t in asset_types.items() if t == 'taxable'), None)
+                if target:
+                    portfolio[target] = portfolio.get(target, 0.0) + move
+                    cash_sleeve_balance -= move
         
         # 1. ADD ONE-TIME ASSETS
         for oa in params.other_assets:
@@ -701,7 +951,7 @@ def run_simulation(params: SimParams):
                         needed -= (take * 0.75)
                         if needed <= 0.1:
                             break
-            
+
             # 1. Brokerage Stocks
             if needed > 0:
                 for n, v in portfolio.items():
@@ -723,6 +973,12 @@ def run_simulation(params: SimParams):
                         inc_tracker["bitcoin_withdrawals"] += take
                         needed -= (take * 0.85)
                         if needed <= 0.1: break
+
+            # Cash sleeve (already after-tax cash)
+            if needed > 0.1 and cash_sleeve_balance > 0:
+                take = min(needed, cash_sleeve_balance)
+                cash_sleeve_balance -= take
+                needed -= take
             
             # 4. Rental Equity
             if needed > 0.1:
@@ -789,10 +1045,11 @@ def run_simulation(params: SimParams):
             "brokerage": sum(v for n, v in portfolio.items() if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower()),
             "bitcoin": sum(v for n, v in portfolio.items() if 'bitcoin' in n.lower()),
             "rental_properties": sum(v for n, v in portfolio.items() if asset_types[n] == 'real_estate' and 'primary' not in n.lower()),
-            "primary_home": sum(v for n, v in portfolio.items() if 'primary' in n.lower())
+            "primary_home": sum(v for n, v in portfolio.items() if 'primary' in n.lower()),
+            "cash_sleeve": cash_sleeve_balance,
         }
         
-        total_assets = sum(portfolio.values())
+        total_assets = sum(portfolio.values()) + cash_sleeve_balance
         
         # Freedom Check
         passive_gross = (inc_tracker["rental_income"] + inc_tracker["dividend_income"] + 

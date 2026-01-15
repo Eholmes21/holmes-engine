@@ -9,11 +9,13 @@
     "r.alwaysUseActiveTerminal": true,
     "git.path": "C:/Users/eholmes1/Git/bin/git.exe",
     "github.copilot.nextEditSuggestions.enabled": true,
+    
+    // Auto-approve ALL Copilot agent actions
     "github.copilot.chat.agent.autoApprove": true,
-    "chat.tools.global.autoApprove": true,
-    "chat.tools.terminal.autoApprove": true,
-   
-    "chat.tools.urls.autoApprove": {
-       
-    }
+    "chat.agent.autoApprove": true,
+    "chat.tools.autoApprove": true,
+    "chat.commandCenter.enabled": true,
+    "chat.editing.autoApplyDelay": 0,
+    "chat.editing.confirmEditRequestRemoval": false,
+    "chat.editing.confirmEditRequestRetry": false
 }

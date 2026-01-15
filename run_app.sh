@@ -1,7 +1,13 @@
 #!/bin/bash
-# Navigate to the backend directory
-cd backend
-# Activate the virtual environment
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Backend (FastAPI)
+cd "$ROOT_DIR/backend"
 source venv/bin/activate
-# Run the FastAPI application
-python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+python3 -m uvicorn main:app --reload --host 127.0.0.1 --port 8000 &
+
+# Frontend (Vite)
+cd "$ROOT_DIR/frontend"
+npm run dev -- --host 127.0.0.1 --port 5173
