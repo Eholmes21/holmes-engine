@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ComposedChart, Bar, Line, Legend, ReferenceLine } from 'recharts';
-import { Settings, TrendingUp, DollarSign, Activity, Home, Briefcase, PiggyBank, CreditCard, Plus, Trash2, BarChart3, Sliders } from 'lucide-react';
+import { Settings, TrendingUp, Activity, Home, Briefcase, PiggyBank, CreditCard, Plus, Trash2, BarChart3, Sliders } from 'lucide-react';
 
 // Hidden default values - restored via Konami code
 const DEFAULT_ASSETS = [
@@ -32,7 +32,13 @@ const DEFAULT_ONE_TIME_EXPENSES = [
   { name: "One-Time Expense 1", amount: 0, year: 2030, add_to_primary_home: false },
   { name: "One-Time Expense 2", amount: 0, year: 2035, add_to_primary_home: false }
 ];
-const DEFAULT_RATES = { inflation: 3.5, stockGrowth: 6, realEstateGrowth: 2.0, retireAge: 50 };
+const DEFAULT_RATES = {
+  inflation: 3.5,
+  stockGrowth: 6,
+  realEstateGrowth: 2.0,
+  retireAge: 50,
+  retirementWithdrawalAge: 70,
+};
 
 // Randomize helper
 const randomFactor = (pct) => 1 + (Math.random() * 2 - 1) * pct;
@@ -63,6 +69,9 @@ export default function App() {
     stockVolatility: 15,      // % standard deviation for stocks
     realEstateVolatility: 8,  // % standard deviation for real estate
     inflationVolatility: 0, // % standard deviation for inflation (default off)
+    spendingRuleStockDownPct: 0,
+    spendingRuleReduceSpendingPct: 0,
+    spendingRuleYears: 0,
   });
   const [mcResults, setMcResults] = useState(null);
   const [mcRunning, setMcRunning] = useState(false);
@@ -79,11 +88,7 @@ export default function App() {
   const [inflation, setInflation] = useState(() => randomizeRate(DEFAULT_RATES.inflation));
   const [stockGrowth, setStockGrowth] = useState(() => randomizeRate(DEFAULT_RATES.stockGrowth));
   const [realEstateGrowth, setRealEstateGrowth] = useState(() => randomizeRate(DEFAULT_RATES.realEstateGrowth));
-  const [retirementWithdrawalAge, setRetirementWithdrawalAge] = useState(60);
-
-  // Cash sleeve (starts at retirement)
-  const [cashSleevePct, setCashSleevePct] = useState(0);
-  const [cashSleeveTaperYears, setCashSleeveTaperYears] = useState(0);
+  const [retirementWithdrawalAge, setRetirementWithdrawalAge] = useState(DEFAULT_RATES.retirementWithdrawalAge);
 
   // Matches backend dividend assumption (2% dividend yield from taxable brokerage stocks).
   // We treat the Stock Growth % input as price/appreciation; pre-tax 401k and Roth get price + dividend (reinvested).
@@ -123,6 +128,7 @@ export default function App() {
           setStockGrowth(DEFAULT_RATES.stockGrowth);
           setRealEstateGrowth(DEFAULT_RATES.realEstateGrowth);
           setRetireAge(DEFAULT_RATES.retireAge);
+          setRetirementWithdrawalAge(DEFAULT_RATES.retirementWithdrawalAge);
           konamiIndex = 0;
           console.log('🎮 Defaults restored!');
         }
@@ -172,8 +178,6 @@ export default function App() {
             outflows: apiOutflows,
             other_assets: otherAssets,
             one_time_expenses: oneTimeExpenses,
-            cash_sleeve_pct: cashSleevePct / 100,
-            cash_sleeve_taper_years: cashSleeveTaperYears,
           })
         });
 
@@ -200,7 +204,7 @@ export default function App() {
       }
     };
     runSim();
-  }, [API_URL, currentAge, retireAge, inflation, stockGrowth, realEstateGrowth, retirementWithdrawalAge, cashSleevePct, cashSleeveTaperYears, assets, inflows, outflows, otherAssets, oneTimeExpenses]);
+  }, [API_URL, currentAge, retireAge, inflation, stockGrowth, realEstateGrowth, retirementWithdrawalAge, assets, inflows, outflows, otherAssets, oneTimeExpenses]);
 
   // Update asset growth rates when global rates change
   useEffect(() => {
@@ -289,13 +293,16 @@ export default function App() {
           outflows: apiOutflows,
           other_assets: otherAssets,
           one_time_expenses: oneTimeExpenses,
-          cash_sleeve_pct: cashSleevePct / 100,
-          cash_sleeve_taper_years: cashSleeveTaperYears,
         },
         num_runs: mcSettings.numRuns,
         stock_volatility: mcSettings.stockVolatility / 100,
         real_estate_volatility: mcSettings.realEstateVolatility / 100,
         inflation_volatility: mcSettings.inflationVolatility / 100,
+        spending_rule: {
+          stock_down_threshold: (Number(mcSettings.spendingRuleStockDownPct) || 0) / 100,
+          reduce_spending_pct: (Number(mcSettings.spendingRuleReduceSpendingPct) || 0) / 100,
+          years: Math.max(0, Number(mcSettings.spendingRuleYears) || 0),
+        },
         seed,
       };
 
@@ -354,6 +361,7 @@ export default function App() {
           stock_volatility: mcResults.request.stock_volatility,
           real_estate_volatility: mcResults.request.real_estate_volatility,
           inflation_volatility: mcResults.request.inflation_volatility,
+          spending_rule: mcResults.request.spending_rule,
           seed: mcResults.request.seed,
         })
       });
@@ -383,23 +391,19 @@ export default function App() {
     fetchInspectRun();
   }, [activeTab, mcResults, inspectRunIndex, fetchInspectRun]);
 
-  const inspectNetIncomeSeries = useMemo(() => {
+  const inspectNetWorthChangeSeries = useMemo(() => {
     const tl = inspectRun?.timeline;
     if (!Array.isArray(tl)) return [];
 
+    let prev = null;
     return tl.map((row) => {
-      const totalIncomeAfterTax = Object.entries(row).reduce((sum, [k, v]) => {
-        if (k.endsWith('_after_tax') && !k.toLowerCase().includes('withdrawal')) {
-          return sum + (Number(v) || 0);
-        }
-        return sum;
-      }, 0);
-
-      const totalExpenses = Number(row?.total_expenses) || 0;
+      const curr = Number(row?.nominal_net_worth) || 0;
+      const delta = prev == null ? 0 : (curr - prev);
+      prev = curr;
       return {
         age: row?.age,
         year: row?.year,
-        net_income: totalIncomeAfterTax - totalExpenses,
+        net_worth_change: Math.round(delta),
       };
     });
   }, [inspectRun]);
@@ -732,15 +736,15 @@ export default function App() {
 
   const ExpensesByYearTooltip = ({ active, payload, label }) => {
     if (active && payload && payload.length) {
-      const year = Number(label);
-      const age = currentAge + (year - 2025);
       const d = payload[0]?.payload;
+      const year = Number(d?.year);
+      const age = Number.isFinite(Number(d?.age)) ? Number(d?.age) : Number(label);
 
       return (
         <div className="bg-slate-900 p-3 rounded border border-slate-700 shadow-lg">
           <p className="text-slate-300 font-semibold mb-2">{`Year ${year} (Age ${age})`}</p>
           <p className="text-sm text-slate-200">
-            {`Total Nominal Expenses: ${formatValueDetailed(d?.total_expenses)}`}
+            {`Total Nominal Expenses + Taxes: ${formatValueDetailed(d?.total_expenses)}`}
           </p>
           {payload
             .filter(e => e?.value && Number(e.value) !== 0)
@@ -768,6 +772,11 @@ export default function App() {
     '#facc15', // yellow
   ];
 
+  // Expenses-by-Year chart palettes
+  // Reuse the same set of colors above (no new colors).
+  const COOL_EXPENSE_COLORS = ['#10b981', '#3b82f6', '#8b5cf6', '#06b6d4', '#9ca3af'];
+  const WARM_TAX_COLORS = ['#ef4444', '#f59e0b', '#f97316', '#ec4899', '#facc15'];
+
   const expenseSeries = useMemo(() => {
     const used = new Set();
     const baseKey = (name) => {
@@ -792,7 +801,7 @@ export default function App() {
       kind: 'outflow',
       key: uniqueKey(baseKey(o?.name) || `expense_${idx + 1}`),
       name: o?.name || `Expense ${idx + 1}`,
-      fill: EXPENSE_STACK_COLORS[idx % EXPENSE_STACK_COLORS.length],
+      fill: COOL_EXPENSE_COLORS[idx % COOL_EXPENSE_COLORS.length],
       outflow: o,
     }));
 
@@ -802,7 +811,31 @@ export default function App() {
         kind: 'oneTime',
         key: uniqueKey('one_time_expenses'),
         name: 'One-Time Expenses',
-        fill: EXPENSE_STACK_COLORS[series.length % EXPENSE_STACK_COLORS.length],
+        fill: COOL_EXPENSE_COLORS[series.length % COOL_EXPENSE_COLORS.length],
+      });
+    }
+
+    // Taxes (from backend timeline fields)
+    const taxDefs = [
+      { key: 'tax_retirement', name: 'Tax: 401k / Pre-Tax Withdrawals' },
+      { key: 'tax_brokerage', name: 'Tax: Brokerage Sales' },
+      { key: 'tax_bitcoin', name: 'Tax: Bitcoin Sales' },
+      { key: 'tax_w2', name: 'Tax: W2' },
+      { key: 'tax_rental', name: 'Tax: Rental Income' },
+      { key: 'tax_royalty', name: 'Tax: Royalties' },
+      { key: 'tax_dividend', name: 'Tax: Dividends' },
+      { key: 'tax_social_security', name: 'Tax: Social Security' },
+      { key: 'tax_other', name: 'Tax: Other Income' },
+    ];
+
+    for (let i = 0; i < taxDefs.length; i += 1) {
+      const td = taxDefs[i];
+      series.push({
+        kind: 'tax',
+        key: uniqueKey(td.key),
+        name: td.name,
+        taxKey: td.key,
+        fill: WARM_TAX_COLORS[i % WARM_TAX_COLORS.length],
       });
     }
 
@@ -834,6 +867,8 @@ export default function App() {
           v = (oneTimeExpenses || [])
             .filter(e => Number(e?.year) === year)
             .reduce((sum, e) => sum + Number(e?.amount || 0), 0);
+        } else if (s.kind === 'tax') {
+          v = Number(pt?.[s.taxKey]) || 0;
         }
 
         const rounded = Number.isFinite(v) ? Math.round(v) : 0;
@@ -1130,9 +1165,9 @@ export default function App() {
                     onChange={e => setMcSettings(prev => ({...prev, numRuns: Math.max(1, Number(e.target.value))}))}
                     className={inputClass}
                     min="1"
-                    max="1000"
+                    max="100000"
                   />
-                  <p className="text-xs text-slate-500 mt-1">More runs = smoother results (1-1000)</p>
+                  <p className="text-xs text-slate-500 mt-1">More runs = smoother results (1-100000)</p>
                 </div>
                 <div>
                   <label className={labelClass}>Stock/Equity Volatility (% Std Dev)</label>
@@ -1177,6 +1212,38 @@ export default function App() {
                   </p>
                 </div>
               </div>
+
+              <div className="mt-4 text-slate-300 text-sm flex items-center gap-2">
+                <span>If stocks are down</span>
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  value={mcSettings.spendingRuleStockDownPct}
+                  onChange={e => setMcSettings(prev => ({...prev, spendingRuleStockDownPct: Math.max(0, Number(e.target.value))}))}
+                  className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm focus:border-emerald-500 focus:outline-none"
+                />
+                <span>%, reduce spending</span>
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  max="100"
+                  value={mcSettings.spendingRuleReduceSpendingPct}
+                  onChange={e => setMcSettings(prev => ({...prev, spendingRuleReduceSpendingPct: Math.max(0, Math.min(100, Number(e.target.value)))}))}
+                  className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm focus:border-emerald-500 focus:outline-none"
+                />
+                <span>% for</span>
+                <input
+                  type="number"
+                  step="1"
+                  min="0"
+                  value={mcSettings.spendingRuleYears}
+                  onChange={e => setMcSettings(prev => ({...prev, spendingRuleYears: Math.max(0, Number(e.target.value))}))}
+                  className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm focus:border-emerald-500 focus:outline-none"
+                />
+                <span>years</span>
+              </div>
               
               {mcResults && (
                 <div className="mt-6 pt-6 border-t border-slate-700">
@@ -1200,6 +1267,28 @@ export default function App() {
                 <div className="mt-6 bg-slate-900 p-4 rounded-xl border border-slate-700">
                   <h3 className="text-lg font-semibold mb-2">Monte Carlo: Yearly Stock Returns (Box &amp; Whisker)</h3>
                   <BoxWhiskerChart data={mcResults.stockReturnBoxData} />
+                </div>
+              )}
+
+              {mcResults?.expensePercentileData?.length > 0 && (
+                <div className="mt-6 bg-slate-900 p-4 rounded-xl border border-slate-700 h-[360px]">
+                  <h3 className="text-lg font-semibold mb-2">Monte Carlo: Expenses by Year (Percentiles)</h3>
+                  <ResponsiveContainer width="100%" height="90%">
+                    <ComposedChart data={mcResults.expensePercentileData}>
+                      <XAxis dataKey="age" stroke="#64748b" tick={{fontSize: 11}} />
+                      <YAxis stroke="#64748b" tickFormatter={formatValue} tick={{fontSize: 11}} />
+                      <Tooltip 
+                        contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #475569' }}
+                        formatter={(value) => ['$' + Number(value).toLocaleString(), '']}
+                        labelFormatter={(age) => `Age ${age}`}
+                      />
+                      <Legend wrapperStyle={{fontSize: 10}} />
+                      <Area type="monotone" dataKey="p90" stackId="range" stroke="none" fill="#ef4444" fillOpacity={0.2} name="P90" />
+                      <Area type="monotone" dataKey="p75" stackId="range2" stroke="none" fill="#f97316" fillOpacity={0.3} name="P75" />
+                      <Area type="monotone" dataKey="p50" stackId="range3" stroke="none" fill="#eab308" fillOpacity={0.4} name="Median" />
+                      <Line type="monotone" dataKey="mean" stroke="#10b981" strokeWidth={2} dot={false} name="Mean" />
+                    </ComposedChart>
+                  </ResponsiveContainer>
                 </div>
               )}
               
@@ -1287,6 +1376,12 @@ export default function App() {
                             <XAxis dataKey="age" tick={{ fill: '#94a3b8', fontSize: 12 }} />
                             <YAxis tick={{ fill: '#94a3b8', fontSize: 12 }} tickFormatter={formatPctAxis} />
                             <Tooltip content={<RunInspectorStockTooltip />} />
+                            <ReferenceLine
+                              y={0}
+                              stroke="#94a3b8"
+                              strokeDasharray="5 5"
+                              ifOverflow="extendDomain"
+                            />
                             {inspectStockReturnAvg != null && (
                               <ReferenceLine
                                 y={inspectStockReturnAvg}
@@ -1313,7 +1408,6 @@ export default function App() {
                             <Bar dataKey="retirement_roth" stackId="assets" fill="#3b82f6" name="Roth IRA"/>
                             <Bar dataKey="brokerage" stackId="assets" fill="#8b5cf6" name="Brokerage"/>
                             <Bar dataKey="bitcoin" stackId="assets" fill="#f97316" name="Bitcoin"/>
-                            <Bar dataKey="cash_sleeve" stackId="assets" fill="#9ca3af" name="Cash Sleeve"/>
                             <Bar dataKey="rental_properties" stackId="assets" fill="#f59e0b" name="Rental Properties"/>
                             <Bar dataKey="primary_home" stackId="assets" fill="#06b6d4" name="Primary Home"/>
                           </ComposedChart>
@@ -1321,13 +1415,19 @@ export default function App() {
                       </div>
 
                       <div className="bg-slate-900 p-4 rounded-xl border border-slate-700 h-[360px] lg:col-span-2">
-                        <h3 className="text-lg font-semibold mb-2">Net Income Through Time (After-Tax Income − Expenses)</h3>
+                        <h3 className="text-lg font-semibold mb-2">Change in Net Worth Through Time (This Year − Last Year)</h3>
                         <ResponsiveContainer width="100%" height="90%">
-                          <ComposedChart data={inspectNetIncomeSeries}>
+                          <ComposedChart data={inspectNetWorthChangeSeries}>
                             <XAxis dataKey="age" tick={{ fill: '#94a3b8', fontSize: 12 }} />
                             <YAxis tick={{ fill: '#94a3b8', fontSize: 12 }} tickFormatter={formatValue} />
                             <Tooltip content={<RunInspectorMoneyTooltip />} />
-                            <Line type="monotone" dataKey="net_income" name="Net Income" stroke="#f59e0b" strokeWidth={2} dot={false} />
+                            <ReferenceLine
+                              y={0}
+                              stroke="#94a3b8"
+                              strokeDasharray="5 5"
+                              ifOverflow="extendDomain"
+                            />
+                            <Line type="monotone" dataKey="net_worth_change" name="Δ Net Worth" stroke="#f59e0b" strokeWidth={2} dot={false} />
                           </ComposedChart>
                         </ResponsiveContainer>
                       </div>
@@ -1410,40 +1510,6 @@ export default function App() {
                 <div>
                   <label className={labelClass}>RE Appreciation %</label>
                   <input type="number" step="0.1" value={realEstateGrowth} onChange={e => setRealEstateGrowth(Number(e.target.value))} className={inputClass}/>
-                </div>
-              </div>
-            </div>
-
-            {/* Cash Sleeve */}
-            <div className={cardClass}>
-              <h3 className="text-lg font-semibold flex items-center gap-2 text-slate-300 mb-4">
-                <DollarSign size={20}/> Cash Sleeve (Starts at Retirement)
-              </h3>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className={labelClass}>Cash Sleeve % of Liquid (Brokerage + BTC)</label>
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0"
-                    max="100"
-                    value={cashSleevePct}
-                    onChange={e => setCashSleevePct(Math.max(0, Math.min(100, Number(e.target.value))))}
-                    className={inputClass}
-                  />
-                  <p className="text-xs text-slate-500 mt-1">Swept once at retirement (after-tax), then held in cash.</p>
-                </div>
-                <div>
-                  <label className={labelClass}>Taper to Zero (Years)</label>
-                  <input
-                    type="number"
-                    min="0"
-                    max="50"
-                    value={cashSleeveTaperYears}
-                    onChange={e => setCashSleeveTaperYears(Math.max(0, Number(e.target.value)))}
-                    className={inputClass}
-                  />
-                  <p className="text-xs text-slate-500 mt-1">Linear reinvest into Brokerage (untaxed). Cash grows at inflation.</p>
                 </div>
               </div>
             </div>
@@ -1714,7 +1780,6 @@ export default function App() {
                     <Bar dataKey="retirement_roth" stackId="assets" fill="#3b82f6" name="Roth IRA"/>
                     <Bar dataKey="brokerage" stackId="assets" fill="#8b5cf6" name="Brokerage"/>
                     <Bar dataKey="bitcoin" stackId="assets" fill="#f97316" name="Bitcoin"/>
-                    <Bar dataKey="cash_sleeve" stackId="assets" fill="#9ca3af" name="Cash Sleeve"/>
                     <Bar dataKey="rental_properties" stackId="assets" fill="#f59e0b" name="Rental Properties"/>
                     <Bar dataKey="primary_home" stackId="assets" fill="#06b6d4" name="Primary Home"/>
                     <Line type="monotone" dataKey="real_net_worth" stroke="#ef4444" strokeWidth={2} strokeDasharray="5 5" dot={false} name="Real Net Worth"/>
@@ -1752,7 +1817,7 @@ export default function App() {
               <div style={{width: '100%', height: '300px'}}>
                 <ResponsiveContainer width="100%" height="100%">
                   <ComposedChart data={expensesByYearData}>
-                    <XAxis dataKey="year" stroke="#64748b" tick={{fontSize: 11}} interval="preserveStartEnd" />
+                    <XAxis dataKey="age" stroke="#64748b" tick={{fontSize: 11}} interval="preserveStartEnd" />
                     <YAxis stroke="#64748b" tickFormatter={formatValue} tick={{fontSize: 11}}/>
                     <Tooltip content={<ExpensesByYearTooltip />} />
                     <Legend wrapperStyle={{fontSize: 10}}/>
