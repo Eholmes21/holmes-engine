@@ -62,7 +62,7 @@ export default function App() {
   const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 
   // Navigation state
-  const [activeTab, setActiveTab] = useState('main'); // 'main' | 'monteCarlo' | 'runInspector'
+  const [activeTab, setActiveTab] = useState('main'); // 'main' | 'monteCarlo'
 
   // Monte Carlo state
   const [mcSettings, setMcSettings] = useState({
@@ -404,7 +404,7 @@ export default function App() {
   }, [API_URL, inspectRunIndex, mcResults]);
 
   useEffect(() => {
-    if (activeTab !== 'runInspector') return;
+    if (activeTab !== 'monteCarlo') return;
     if (!mcResults?.request) return;
     fetchInspectRun();
   }, [activeTab, mcResults, inspectRunIndex, fetchInspectRun]);
@@ -1248,16 +1248,9 @@ const RUN_FILTER_OPTIONS = [
         <button
           onClick={() => setActiveTab('monteCarlo')}
           className={`p-3 rounded-lg transition-colors ${activeTab === 'monteCarlo' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:bg-slate-700 hover:text-white'}`}
-          title="Monte Carlo Settings"
+          title="Monte Carlo"
         >
           <Sliders size={24}/>
-        </button>
-        <button
-          onClick={() => setActiveTab('runInspector')}
-          className={`p-3 rounded-lg transition-colors ${activeTab === 'runInspector' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:bg-slate-700 hover:text-white'}`}
-          title="Run Inspector"
-        >
-          <Activity size={24}/>
         </button>
       </div>
 
@@ -1294,7 +1287,7 @@ const RUN_FILTER_OPTIONS = [
           </div>
         </div>
 
-        {/* Monte Carlo Settings Tab */}
+        {/* Monte Carlo Tab */}
         {activeTab === 'monteCarlo' && (
           <div className="w-full px-6 py-6">
             <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
@@ -1430,13 +1423,6 @@ const RUN_FILTER_OPTIONS = [
                 </div>
               )}
 
-              {mcResults?.stockReturnBoxData?.length > 0 && (
-                <div className="mt-6 bg-slate-900 p-4 rounded-xl border border-slate-700">
-                  <h3 className="text-lg font-semibold mb-2">Monte Carlo: Yearly Stock Returns (Box &amp; Whisker)</h3>
-                  <BoxWhiskerChart data={mcResults.stockReturnBoxData} />
-                </div>
-              )}
-
               {mcResults?.expensePercentileData?.length > 0 && (
                 <div className="mt-6 bg-slate-900 p-4 rounded-xl border border-slate-700 h-[360px]">
                   <h3 className="text-lg font-semibold mb-2">Monte Carlo: Expenses by Year (Percentiles)</h3>
@@ -1468,13 +1454,7 @@ const RUN_FILTER_OPTIONS = [
                 {mcRunning ? 'Running Simulations...' : 'Run Monte Carlo Simulation'}
               </button>
             </div>
-          </div>
-        )}
-
-        {/* Run Inspector Tab */}
-        {activeTab === 'runInspector' && (
-          <div className="w-full px-6 py-6">
-            <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
+            <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 mt-6">
               <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
                 <Activity size={24}/> Run Inspector
               </h2>
