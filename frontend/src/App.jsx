@@ -1,19 +1,20 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ComposedChart, Bar, Line, Legend, ReferenceLine } from 'recharts';
-import { Settings, TrendingUp, Activity, Home, Briefcase, PiggyBank, CreditCard, Plus, Trash2, BarChart3, Sliders } from 'lucide-react';
+import { Settings, TrendingUp, Activity, Home, Briefcase, PiggyBank, CreditCard, Plus, Trash2, BarChart3, Sliders, ChevronUp, ChevronDown } from 'lucide-react';
 
 // Hidden default values - restored via Konami code
+const DEFAULT_REAL_ESTATE_GROWTH = 4.0;
 const DEFAULT_ASSETS = [
   { name: "401k", value: 1200000, growth_rate: 5.5, tax_treatment: "pre_tax" },
   { name: "Roth IRA", value: 80000, growth_rate: 5.5, tax_treatment: "roth" },
   { name: "Brokerage (Stocks)", value: 250000, growth_rate: 5.5, tax_treatment: "taxable" },
   { name: "Bitcoin", value: 135000, growth_rate: 7.0, tax_treatment: "taxable" },
-  { name: "Rental Portfolio", value: 2060000, growth_rate: 2.0, tax_treatment: "real_estate" },
-  { name: "Primary Home", value: 750000, growth_rate: 2.0, tax_treatment: "real_estate" }
+  { name: "Rental Portfolio", value: 2060000, growth_rate: DEFAULT_REAL_ESTATE_GROWTH, tax_treatment: "real_estate" },
+  { name: "Primary Home", value: 750000, growth_rate: DEFAULT_REAL_ESTATE_GROWTH, tax_treatment: "real_estate" }
 ];
 const DEFAULT_INFLOWS = [
   { name: "W2 Salary", amount: 400000, start_year: 2025, end_year: 2035, growth_rate: 3.5 },
-  { name: "Rental Profit", amount: 60000, start_year: 2032, end_year: 2090, growth_rate: 2.0 },
+  { name: "Rental Profit", amount: 60000, start_year: 2032, end_year: 2090, growth_rate: DEFAULT_REAL_ESTATE_GROWTH },
   { name: "Royalties", amount: 36000, start_year: 2030, end_year: 2050, growth_rate: 0.0 },
   { name: "Social Security", amount: 34000, start_year: 2054, end_year: 2090, growth_rate: 2.5 }
 ];
@@ -35,7 +36,7 @@ const DEFAULT_ONE_TIME_EXPENSES = [
 const DEFAULT_RATES = {
   inflation: 3.5,
   stockGrowth: 6,
-  realEstateGrowth: 2.0,
+  realEstateGrowth: DEFAULT_REAL_ESTATE_GROWTH,
   retireAge: 50,
   retirementWithdrawalAge: 70,
 };
@@ -69,18 +70,29 @@ export default function App() {
     stockVolatility: 15,      // % standard deviation for stocks
     realEstateVolatility: 8,  // % standard deviation for real estate
     inflationVolatility: 0, // % standard deviation for inflation (default off)
-    spendingRuleStockDownPct: 0,
-    spendingRuleReduceSpendingPct: 0,
-    spendingRuleYears: 0,
   });
   const [mcResults, setMcResults] = useState(null);
   const [mcRunning, setMcRunning] = useState(false);
+
+  const [spendingRules, setSpendingRules] = useState([
+    { stockDownPct: 10, reduceSpendingPct: 10, years: 2 },
+    { stockDownPct: 20, reduceSpendingPct: 20, years: 3 },
+    { stockDownPct: 30, reduceSpendingPct: 40, years: 5 },
+  ]);
+
+  const updateSpendingRule = (index, field, value) => {
+    setSpendingRules(prev => prev.map((rule, idx) => idx === index ? {
+      ...rule,
+      [field]: value,
+    } : rule));
+  };
 
   // Monte Carlo run inspector state
   const [inspectRunIndex, setInspectRunIndex] = useState(0);
   const [inspectRun, setInspectRun] = useState(null);
   const [inspectRunning, setInspectRunning] = useState(false);
   const [inspectError, setInspectError] = useState(null);
+  const [runFilter, setRunFilter] = useState('all');
 
   // Core assumptions - start randomized
   const [currentAge, setCurrentAge] = useState(38);
@@ -281,6 +293,14 @@ export default function App() {
 
       const seed = Math.floor(Math.random() * 2 ** 31);
 
+      const normalizedSpendingRules = spendingRules
+        .map(rule => ({
+          stock_down_threshold: (Number(rule.stockDownPct) || 0) / 100,
+          reduce_spending_pct: (Number(rule.reduceSpendingPct) || 0) / 100,
+          years: Math.max(0, Math.round(Number(rule.years) || 0)),
+        }))
+        .filter(rule => rule.stock_down_threshold > 0 && rule.reduce_spending_pct > 0 && rule.years > 0);
+
       const requestBody = {
         params: {
           current_year: 2025,
@@ -298,11 +318,7 @@ export default function App() {
         stock_volatility: mcSettings.stockVolatility / 100,
         real_estate_volatility: mcSettings.realEstateVolatility / 100,
         inflation_volatility: mcSettings.inflationVolatility / 100,
-        spending_rule: {
-          stock_down_threshold: (Number(mcSettings.spendingRuleStockDownPct) || 0) / 100,
-          reduce_spending_pct: (Number(mcSettings.spendingRuleReduceSpendingPct) || 0) / 100,
-          years: Math.max(0, Number(mcSettings.spendingRuleYears) || 0),
-        },
+        spending_rules: normalizedSpendingRules,
         seed,
       };
 
@@ -329,6 +345,7 @@ export default function App() {
         numRuns: result.numRuns,
         seed,
         request: requestBody,
+        runOutcomes: Array.isArray(result.runOutcomes) ? result.runOutcomes : [],
       });
 
       setInspectRunIndex(0);
@@ -361,6 +378,7 @@ export default function App() {
           stock_volatility: mcResults.request.stock_volatility,
           real_estate_volatility: mcResults.request.real_estate_volatility,
           inflation_volatility: mcResults.request.inflation_volatility,
+          spending_rules: mcResults.request.spending_rules,
           spending_rule: mcResults.request.spending_rule,
           seed: mcResults.request.seed,
         })
@@ -390,6 +408,83 @@ export default function App() {
     if (!mcResults?.request) return;
     fetchInspectRun();
   }, [activeTab, mcResults, inspectRunIndex, fetchInspectRun]);
+
+  const totalRuns = Math.max(0, Number(mcResults?.numRuns || mcResults?.request?.num_runs || 0));
+  const maxRunIndex = Math.max(0, totalRuns - 1);
+
+  const filteredRunIndexes = useMemo(() => {
+    const matchesFilter = (success) => {
+      if (runFilter === 'all') return true;
+      if (runFilter === 'success') return success === true;
+      if (runFilter === 'failure') return success === false;
+      return true;
+    };
+
+    const outcomes = Array.isArray(mcResults?.runOutcomes) ? mcResults.runOutcomes : [];
+    if (!outcomes.length) {
+      return runFilter === 'all'
+        ? Array.from({ length: totalRuns }, (_, i) => i)
+        : [];
+    }
+
+    return outcomes
+      .map((success, index) => (matchesFilter(success) ? index : null))
+      .filter((idx) => idx !== null);
+  }, [totalRuns, mcResults?.runOutcomes, runFilter]);
+
+  const currentFilteredPosition = filteredRunIndexes.indexOf(inspectRunIndex);
+
+  const goToAdjacentFilteredRun = useCallback((direction) => {
+    if (!filteredRunIndexes.length) return;
+    let nextPos = currentFilteredPosition;
+    if (nextPos === -1) {
+      nextPos = direction > 0 ? 0 : filteredRunIndexes.length - 1;
+    } else {
+      nextPos = Math.max(0, Math.min(filteredRunIndexes.length - 1, nextPos + direction));
+    }
+    setInspectRunIndex(filteredRunIndexes[nextPos]);
+  }, [filteredRunIndexes, currentFilteredPosition]);
+
+  useEffect(() => {
+    if (runFilter === 'all') return;
+    if (!filteredRunIndexes.length) return;
+    setInspectRunIndex(filteredRunIndexes[0]);
+  }, [runFilter, filteredRunIndexes]);
+
+  const handleRunIndexChange = useCallback((value) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return;
+    const maxIndex = Math.max(0, totalRuns - 1);
+    const sanitized = Math.max(0, Math.min(maxIndex, Math.round(parsed)));
+
+    if (runFilter === 'all' || !filteredRunIndexes.length) {
+      setInspectRunIndex(sanitized);
+      return;
+    }
+
+    if (filteredRunIndexes.includes(sanitized)) {
+      setInspectRunIndex(sanitized);
+      return;
+    }
+
+    const direction = sanitized > inspectRunIndex ? 1 : (sanitized < inspectRunIndex ? -1 : 0);
+    if (direction === 0) return;
+
+    if (direction > 0) {
+      const next = filteredRunIndexes.find(index => index > inspectRunIndex);
+      if (next !== undefined) {
+        setInspectRunIndex(next);
+      }
+      return;
+    }
+
+    for (let i = filteredRunIndexes.length - 1; i >= 0; i -= 1) {
+      if (filteredRunIndexes[i] < inspectRunIndex) {
+        setInspectRunIndex(filteredRunIndexes[i]);
+        break;
+      }
+    }
+  }, [filteredRunIndexes, inspectRunIndex, runFilter, totalRuns]);
 
   const inspectNetWorthChangeSeries = useMemo(() => {
     const tl = inspectRun?.timeline;
@@ -602,6 +697,12 @@ export default function App() {
     };
   };
 
+
+const RUN_FILTER_OPTIONS = [
+  { value: 'all', label: 'All runs' },
+  { value: 'success', label: 'Success only' },
+  { value: 'failure', label: 'Failures only' },
+];
   const empiricalRanges = (meanDecimal, sdDecimal, kind) => {
     const mean = Number(meanDecimal);
     const sd = Number(sdDecimal);
@@ -842,6 +943,25 @@ export default function App() {
     return series;
   }, [outflows, oneTimeExpenses]);
 
+  const inspectExpenseSeries = useMemo(() => {
+    return [
+      {
+        key: 'expense_net',
+        name: 'Expenses (net of taxes)',
+        fill: COOL_EXPENSE_COLORS[0],
+      },
+      { key: 'tax_retirement', name: 'Tax: 401k / Pre-Tax Withdrawals', fill: WARM_TAX_COLORS[0] },
+      { key: 'tax_brokerage', name: 'Tax: Brokerage Sales', fill: WARM_TAX_COLORS[1] },
+      { key: 'tax_bitcoin', name: 'Tax: Bitcoin Sales', fill: WARM_TAX_COLORS[2] },
+      { key: 'tax_w2', name: 'Tax: W2', fill: WARM_TAX_COLORS[3] },
+      { key: 'tax_rental', name: 'Tax: Rental Income', fill: WARM_TAX_COLORS[4] },
+      { key: 'tax_royalty', name: 'Tax: Royalties', fill: '#d946ef' },
+      { key: 'tax_dividend', name: 'Tax: Dividends', fill: '#fbbf24' },
+      { key: 'tax_social_security', name: 'Tax: Social Security', fill: '#14b8a6' },
+      { key: 'tax_other', name: 'Tax: Other Income', fill: '#94a3af' },
+    ];
+  }, []);
+
   const expensesByYearData = useMemo(() => {
     if (!data || !Array.isArray(data)) return [];
     const baseYear = 2025;
@@ -880,6 +1000,30 @@ export default function App() {
       return row;
     });
   }, [data, expenseSeries, inflation, oneTimeExpenses]);
+
+  const inspectExpensesByYearData = useMemo(() => {
+    const tl = inspectRun?.timeline;
+    if (!Array.isArray(tl)) return [];
+
+    return tl.map((row) => {
+      const totalExpenses = Number(row?.total_expenses) || 0;
+      const taxTotal = Number(row?.tax_total) || 0;
+      const net = Math.max(0, totalExpenses - taxTotal);
+      const mapped = {
+        year: Number(row?.year),
+        age: row?.age,
+        total_expenses: Math.round(totalExpenses),
+        expense_net: Math.round(net),
+      };
+
+      inspectExpenseSeries.forEach((s) => {
+        if (s.key === 'expense_net') return;
+        mapped[s.key] = Math.round(Number(row?.[s.key]) || 0);
+      });
+
+      return mapped;
+    });
+  }, [inspectRun?.timeline, inspectExpenseSeries]);
 
   const formatPctAxis = (val) => {
     if (val === undefined || val === null) return '';
@@ -1049,6 +1193,7 @@ export default function App() {
           })}
           
           {/* Tooltip */}
+
           {tooltip && (
             <g>
               <rect x={tooltip.x + 10} y={tooltip.y - 70} width={140} height={100} rx={6} fill="#0f172a" stroke="#334155" strokeWidth={1} />
@@ -1122,7 +1267,7 @@ export default function App() {
         <div className="bg-slate-800 border-b border-slate-700 px-6 py-4">
           <div className="max-w-7xl mx-auto flex justify-between items-center">
             <h1 className="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-500">
-              Holmes Financial Engine
+              Retirement Financial Engine
             </h1>
             <div className="flex gap-3">
               <button 
@@ -1213,36 +1358,58 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="mt-4 text-slate-300 text-sm flex items-center gap-2">
-                <span>If stocks are down</span>
-                <input
-                  type="number"
-                  step="0.1"
-                  min="0"
-                  value={mcSettings.spendingRuleStockDownPct}
-                  onChange={e => setMcSettings(prev => ({...prev, spendingRuleStockDownPct: Math.max(0, Number(e.target.value))}))}
-                  className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm focus:border-emerald-500 focus:outline-none"
-                />
-                <span>%, reduce spending</span>
-                <input
-                  type="number"
-                  step="0.1"
-                  min="0"
-                  max="100"
-                  value={mcSettings.spendingRuleReduceSpendingPct}
-                  onChange={e => setMcSettings(prev => ({...prev, spendingRuleReduceSpendingPct: Math.max(0, Math.min(100, Number(e.target.value)))}))}
-                  className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm focus:border-emerald-500 focus:outline-none"
-                />
-                <span>% for</span>
-                <input
-                  type="number"
-                  step="1"
-                  min="0"
-                  value={mcSettings.spendingRuleYears}
-                  onChange={e => setMcSettings(prev => ({...prev, spendingRuleYears: Math.max(0, Number(e.target.value))}))}
-                  className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm focus:border-emerald-500 focus:outline-none"
-                />
-                <span>years</span>
+              <div className="mt-4">
+                <div className="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2">Layered spending rules</div>
+                <div className="space-y-2">
+                  {spendingRules.map((rule, index) => (
+                    <div key={`spending-rule-${index}`} className="text-slate-300 text-sm flex flex-wrap items-center gap-2">
+                      <span className="text-xs text-slate-400">Rule {index + 1}</span>
+                      <span>If stocks are down</span>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0"
+                        max="100"
+                        value={rule.stockDownPct}
+                        onChange={e => {
+                          const entered = Number(e.target.value);
+                          const clamped = Number.isFinite(entered) ? Math.max(0, Math.min(100, entered)) : 0;
+                          updateSpendingRule(index, 'stockDownPct', clamped);
+                        }}
+                        className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm focus:border-emerald-500 focus:outline-none"
+                      />
+                      <span>%, reduce spending</span>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0"
+                        max="100"
+                        value={rule.reduceSpendingPct}
+                        onChange={e => {
+                          const entered = Number(e.target.value);
+                          const clamped = Number.isFinite(entered) ? Math.max(0, Math.min(100, entered)) : 0;
+                          updateSpendingRule(index, 'reduceSpendingPct', clamped);
+                        }}
+                        className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm focus:border-emerald-500 focus:outline-none"
+                      />
+                      <span>% for</span>
+                      <input
+                        type="number"
+                        step="1"
+                        min="0"
+                        max="50"
+                        value={rule.years}
+                        onChange={e => {
+                          const entered = Number(e.target.value);
+                          const clamped = Number.isFinite(entered) ? Math.max(0, Math.round(Math.min(50, entered))) : 0;
+                          updateSpendingRule(index, 'years', clamped);
+                        }}
+                        className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm focus:border-emerald-500 focus:outline-none"
+                      />
+                      <span>years</span>
+                    </div>
+                  ))}
+                </div>
               </div>
               
               {mcResults && (
@@ -1312,6 +1479,30 @@ export default function App() {
                 <Activity size={24}/> Run Inspector
               </h2>
 
+              <div className="flex flex-wrap items-center gap-2 mb-4">
+                <span className="text-xs uppercase tracking-wider text-slate-500">Filter runs</span>
+                {RUN_FILTER_OPTIONS.map(option => (
+                  <button
+                    key={option.value}
+                    onClick={() => setRunFilter(option.value)}
+                    className={`text-xs px-3 py-1 rounded-full border ${runFilter === option.value ? 'border-emerald-400 bg-emerald-500/20 text-emerald-300' : 'border-slate-700 text-slate-400 hover:border-slate-500'}`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+                {mcResults?.numRuns != null && (
+                  <span className="text-xs text-slate-400 ml-auto">
+                    Matches {filteredRunIndexes.length} / {mcResults.numRuns}
+                  </span>
+                )}
+              </div>
+
+              {runFilter !== 'all' && mcResults?.numRuns && filteredRunIndexes.length === 0 && (
+                <div className="text-xs text-slate-400 mb-4">
+                  No runs match this filter yet. Run Monte Carlo again or switch filters.
+                </div>
+              )}
+
               {!mcResults?.request && (
                 <div className="bg-slate-900 p-4 rounded-lg border border-slate-700 text-slate-200">
                   Run Monte Carlo first, then come back here to inspect an individual run.
@@ -1326,12 +1517,38 @@ export default function App() {
                       <input
                         type="number"
                         min="0"
-                        max={Math.max(0, Number(mcResults.request.num_runs || 1) - 1)}
+                        max={maxRunIndex}
                         value={inspectRunIndex}
-                        onChange={e => setInspectRunIndex(Number(e.target.value))}
+                        onChange={e => handleRunIndexChange(e.target.value)}
                         className={inputClass}
                       />
                       <p className="text-xs text-slate-500 mt-1">Seed: {mcResults.request.seed}</p>
+
+                      <div className="flex items-center gap-2 mt-3">
+                        <button
+                          type="button"
+                          onClick={() => goToAdjacentFilteredRun(-1)}
+                          disabled={!filteredRunIndexes.length}
+                          aria-label="Previous filtered run"
+                          className="p-2 rounded border border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          <ChevronUp size={16}/>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => goToAdjacentFilteredRun(1)}
+                          disabled={!filteredRunIndexes.length}
+                          aria-label="Next filtered run"
+                          className="p-2 rounded border border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          <ChevronDown size={16}/>
+                        </button>
+                        {runFilter !== 'all' && filteredRunIndexes.length > 0 && (
+                          <span className="text-xs text-slate-400">
+                            Match {currentFilteredPosition === -1 ? '-' : currentFilteredPosition + 1} / {filteredRunIndexes.length}
+                          </span>
+                        )}
+                      </div>
                     </div>
 
                     <div>
@@ -1431,6 +1648,23 @@ export default function App() {
                           </ComposedChart>
                         </ResponsiveContainer>
                       </div>
+
+                      {inspectExpensesByYearData.length > 0 && (
+                        <div className="bg-slate-900 p-4 rounded-xl border border-slate-700 h-[360px] lg:col-span-2">
+                          <h3 className="text-lg font-semibold mb-2">Expenses by Year (Run)</h3>
+                          <ResponsiveContainer width="100%" height="90%">
+                            <ComposedChart data={inspectExpensesByYearData}>
+                              <XAxis dataKey="age" stroke="#94a3b8" tick={{ fontSize: 12 }} />
+                              <YAxis stroke="#94a3b8" tickFormatter={formatValue} tick={{ fontSize: 12 }} />
+                              <Tooltip content={<ExpensesByYearTooltip />} />
+                              <Legend wrapperStyle={{ fontSize: 10 }} />
+                              {inspectExpenseSeries.map(series => (
+                                <Bar key={series.key} dataKey={series.key} stackId="expenses" fill={series.fill} name={series.name} />
+                              ))}
+                            </ComposedChart>
+                          </ResponsiveContainer>
+                        </div>
+                      )}
                     </div>
                   )}
                 </>
