@@ -1,1183 +1,813 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Optional
-from fastapi.middleware.cors import CORSMiddleware
-import random
+"""FastAPI surface for the Holmes retirement projection engine.
+
+The accounting rules are implemented once in :mod:`backend.core`.  This
+module owns the wire models and keeps the historical field names used by the
+React client while adding explicit controls for horizon, return source, tax,
+RMD, sale and withdrawal behavior.
+"""
+
+from __future__ import annotations
+
+from datetime import date
 import math
-from pathlib import Path
-import csv
+import re
+from typing import Any, Literal
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+try:  # ``uvicorn main:app`` is launched from the backend directory.
+    from .core import (
+        AccountingBlocked,
+        HistoricalDataError,
+        MAX_MONTE_CARLO_RUNS,
+        TAXABLE_SALE_NET_FACTOR,
+        TAXABLE_SALE_TAX_RATE,
+        _clamp_return,
+        _get_historical_stock_return_bins,
+        _load_yearly_returns_csv,
+        _sample_historical_stock_return,
+        _withdrawal_token,
+        calculate_federal_tax,
+        get_rmd_divisor,
+        monte_carlo,
+        monte_carlo_run,
+        request_fingerprint,
+        simulate_one,
+    )
+except ImportError:  # pragma: no cover - exercised by the standalone runner
+    from core import (  # type: ignore
+        AccountingBlocked,
+        HistoricalDataError,
+        MAX_MONTE_CARLO_RUNS,
+        TAXABLE_SALE_NET_FACTOR,
+        TAXABLE_SALE_TAX_RATE,
+        _clamp_return,
+        _get_historical_stock_return_bins,
+        _load_yearly_returns_csv,
+        _sample_historical_stock_return,
+        _withdrawal_token,
+        calculate_federal_tax,
+        get_rmd_divisor,
+        monte_carlo,
+        monte_carlo_run,
+        request_fingerprint,
+        simulate_one,
+    )
 
 
-TAXABLE_SALE_TAX_RATE = 0.075
-TAXABLE_SALE_NET_FACTOR = 1.0 - TAXABLE_SALE_TAX_RATE
-
-app = FastAPI()
-
+app = FastAPI(title="Holmes Retirement Engine", version="2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
-# --- DATA MODELS ---
-class Asset(BaseModel):
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Keep validation responses useful without echoing caller payloads."""
+
+    details: list[dict[str, str]] = []
+    for error in exc.errors():
+        location = [str(part) for part in error.get("loc", ()) if part not in {"body", "query", "path"}]
+        path = ".".join(location) or "request"
+        code = "REQUIRED" if error.get("type") == "missing" else "VALIDATION_ERROR"
+        raw_message = str(error.get("msg", ""))
+        if "names must be unique" in raw_message:
+            code, path, message = "DUPLICATE_NAME", path or "request", "display names must be unique (case/whitespace-insensitive)"
+        elif "stable IDs must be unique" in raw_message or "IDs must be unique" in raw_message:
+            code, path, message = "DUPLICATE_ID", path or "request", "stable IDs must be unique"
+        elif "plan_through_age must be between" in raw_message:
+            code, path, message = "HORIZON_RANGE", "plan_through_age", "plan-through age must be between 85 and 115"
+        elif "target_retirement_age must be between" in raw_message:
+            code, path, message = "AGE_ORDER", "target_retirement_age", "retirement age must be between current age and plan-through age"
+        elif "return_mode was supplied more than once" in raw_message:
+            code, path, message = "DUPLICATE_MODE", "mode", "mode was supplied more than once"
+        else:
+            message = "field is required" if code == "REQUIRED" else "field violates the retirement.v2 contract"
+        details.append({"path": path, "code": code, "message": message})
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "VALIDATION_ERROR", "message": "Request validation failed", "details": details}},
+    )
+
+
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_ALLOWED_TAX_TREATMENTS = {
+    "pre_tax", "pretax", "traditional", "traditional_ira", "tax_deferred", "401k",
+    "roth", "roth_ira", "tax_free", "tax_advantaged_roth", "tax_advantaged", "bitcoin", "crypto",
+    "tax_deferred_or_roth", "taxable", "real_estate", "property", "rental", "home",
+}
+
+
+def _finite(value: float, field_name: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{field_name} must be a finite number") from None
+    if not math.isfinite(result):
+        raise ValueError(f"{field_name} must be finite")
+    return result
+
+
+def _nonnegative(value: float, field_name: str) -> float:
+    result = _finite(value, field_name)
+    if result < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return result
+
+
+def _nonblank(value: str, field_name: str = "name") -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be nonblank")
+    return value.strip()
+
+
+def _optional_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = _nonblank(value, "id")
+    if not _ID_RE.fullmatch(value):
+        raise ValueError("id must contain only letters, numbers, underscore or hyphen")
+    return value
+
+
+def _aliases(data: Any, mapping: dict[str, str]) -> Any:
+    if not isinstance(data, dict):
+        return data
+    result = dict(data)
+    for old, new in mapping.items():
+        if old in result:
+            if new in result and result[new] != result[old]:
+                raise ValueError(f"{new} was supplied more than once")
+            result[new] = result.pop(old)
+    return result
+
+
+class WireModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+class Asset(WireModel):
+    id: str | None = None
     name: str
     value: float
     growth_rate: float
-    tax_treatment: str 
+    tax_treatment: str = "taxable"
+    dividend_yield: float | None = None
+    property_role: str | None = None
+    workplace_plan: bool = False
+    # Property values are entered as whole-property market values.  The core
+    # multiplies by this ownership fraction before adding the property to the
+    # user's ledger. Mortgage balances are the debt attributable to that owned
+    # share, and scheduled P&I payments become essential annual spending.
+    ownership_percentage: float = 1.0
+    mortgage_balance: float = 0.0
+    mortgage_interest_rate: float = 0.0
+    mortgage_monthly_payment: float = 0.0
+    mortgage_payments_remaining: int = 0
+    # Revenue and operating expenses are entered for the whole property. The
+    # accounting core applies the ownership share and global inflation.
+    annual_revenue: float = 0.0
+    annual_operating_expenses: float = 0.0
 
-class Stream(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def accept_workplace_aliases(cls, data: Any) -> Any:
+        return _aliases(data, {"workplace": "workplace_plan", "rmd_delay_until_retirement": "workplace_plan"})
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, value: str) -> str:
+        return _nonblank(value)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, value: str | None) -> str | None:
+        return _optional_id(value)
+
+    @field_validator(
+        "value",
+        "mortgage_balance",
+        "mortgage_monthly_payment",
+        "annual_revenue",
+        "annual_operating_expenses",
+    )
+    @classmethod
+    def valid_value(cls, value: float) -> float:
+        return _nonnegative(value, "value")
+
+    @field_validator("ownership_percentage")
+    @classmethod
+    def valid_ownership_percentage(cls, value: float) -> float:
+        value = _finite(value, "ownership_percentage")
+        if not 0.0 < value <= 1.0:
+            raise ValueError("ownership_percentage must be greater than 0 and no more than 1")
+        return value
+
+    @field_validator("mortgage_interest_rate")
+    @classmethod
+    def valid_mortgage_interest_rate(cls, value: float) -> float:
+        value = _finite(value, "mortgage_interest_rate")
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("mortgage_interest_rate must be between 0 and 1")
+        return value
+
+    @field_validator("mortgage_payments_remaining")
+    @classmethod
+    def valid_mortgage_payments_remaining(cls, value: int) -> int:
+        if value < 0 or value > 1200:
+            raise ValueError("mortgage_payments_remaining must be between 0 and 1200")
+        return value
+
+    @field_validator("growth_rate")
+    @classmethod
+    def valid_growth(cls, value: float) -> float:
+        value = _finite(value, "growth_rate")
+        if value <= -1.0:
+            raise ValueError("growth_rate must be greater than -1")
+        return value
+
+    @field_validator("dividend_yield")
+    @classmethod
+    def valid_dividend_yield(cls, value: float | None) -> float | None:
+        if value is None:
+            return value
+        value = _finite(value, "dividend_yield")
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("dividend_yield must be between 0 and 1")
+        return value
+
+    @field_validator("tax_treatment")
+    @classmethod
+    def valid_tax_treatment(cls, value: str) -> str:
+        value = _nonblank(value, "tax_treatment").lower()
+        if value not in _ALLOWED_TAX_TREATMENTS:
+            raise ValueError("tax_treatment is unsupported")
+        return value
+
+
+class Stream(WireModel):
+    id: str | None = None
     name: str
     amount: float
     start_year: int
     end_year: int
-    growth_rate: Optional[float] = None
+    growth_rate: float | None = None
+    # Explicit income classification keeps account behavior independent from
+    # display labels.  ``None`` preserves compatibility with older plans and
+    # falls back to the legacy name-based inference in the core.
+    income_type: Literal["w2", "rental", "royalty", "social_security", "other"] | None = None
+    # ``global`` lets Historical Monte Carlo inflation volatility flow through
+    # this stream.  ``custom`` preserves the explicit per-stream rate.
+    growth_mode: Literal["global", "custom"] = "custom"
+    # Adaptive spending applies only to flexible/discretionary expenses by
+    # default. Essential costs can opt out without needing a second planner.
+    discretionary: bool = True
 
-class OtherAsset(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def accept_discretionary_aliases(cls, data: Any) -> Any:
+        result = _aliases(data, {
+            "is_discretionary": "discretionary", "flexible": "discretionary",
+            "incomeType": "income_type", "stream_type": "income_type", "category": "income_type",
+        })
+        if isinstance(result, dict) and result.get("income_type") is not None:
+            value = str(result["income_type"]).strip().lower().replace("-", "_").replace(" ", "_")
+            aliases = {
+                "salary": "w2", "wages": "w2", "employment": "w2",
+                "rental_profit": "rental", "rent": "rental",
+                "royalties": "royalty", "ss": "social_security", "social": "social_security",
+            }
+            result["income_type"] = aliases.get(value, value)
+        return result
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, value: str) -> str:
+        return _nonblank(value)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, value: str | None) -> str | None:
+        return _optional_id(value)
+
+    @field_validator("amount")
+    @classmethod
+    def valid_amount(cls, value: float) -> float:
+        return _nonnegative(value, "amount")
+
+    @field_validator("growth_rate")
+    @classmethod
+    def valid_growth(cls, value: float | None) -> float | None:
+        if value is None:
+            return value
+        value = _finite(value, "growth_rate")
+        if value <= -1.0:
+            raise ValueError("growth_rate must be greater than -1")
+        return value
+
+    @field_validator("income_type")
+    @classmethod
+    def valid_income_type(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        value = _nonblank(value, "income_type").lower().replace("-", "_").replace(" ", "_")
+        if value not in {"w2", "rental", "royalty", "social_security", "other"}:
+            raise ValueError("income_type is unsupported")
+        return value
+
+    @model_validator(mode="after")
+    def valid_years(self) -> "Stream":
+        if self.end_year < self.start_year:
+            raise ValueError("end_year must be no earlier than start_year")
+        return self
+
+
+class OtherAsset(WireModel):
+    id: str | None = None
     name: str
     value: float
     add_year: int
+    destination_account: str | None = None
 
-class OneTimeExpense(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def accept_destination_alias(cls, data: Any) -> Any:
+        return _aliases(data, {"destination": "destination_account", "route": "destination_account"})
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, value: str) -> str:
+        return _nonblank(value)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, value: str | None) -> str | None:
+        return _optional_id(value)
+
+    @field_validator("value")
+    @classmethod
+    def valid_value(cls, value: float) -> float:
+        return _nonnegative(value, "value")
+
+
+class OneTimeExpense(WireModel):
+    id: str | None = None
     name: str
     amount: float
     year: int
     add_to_primary_home: bool = False
+    destination_account: str | None = None
 
-class SimParams(BaseModel):
-    current_year: int = 2025
-    current_age: int = 38
-    target_retirement_age: int
-    retirement_withdrawal_age: int = 60
-    general_inflation: float
-    tax_filing_status: str = "married_joint"
-    assets: List[Asset]
-    inflows: List[Stream]
-    outflows: List[Stream]
-    other_assets: List[OtherAsset] = []
-    one_time_expenses: List[OneTimeExpense] = []
+    @model_validator(mode="before")
+    @classmethod
+    def accept_destination_alias(cls, data: Any) -> Any:
+        return _aliases(data, {"destination": "destination_account", "route": "destination_account"})
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, value: str) -> str:
+        return _nonblank(value)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, value: str | None) -> str | None:
+        return _optional_id(value)
+
+    @field_validator("amount")
+    @classmethod
+    def valid_amount(cls, value: float) -> float:
+        return _nonnegative(value, "amount")
 
 
-class SpendingRule(BaseModel):
-    # Fractions (e.g., 0.2 = 20%)
+class SpendingRule(WireModel):
+    id: str | None = None
     stock_down_threshold: float = 0.0
     reduce_spending_pct: float = 0.0
     years: int = 0
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_frontend_names(cls, data: Any) -> Any:
+        return _aliases(data, {"stockDownPct": "stock_down_threshold", "reduceSpendingPct": "reduce_spending_pct"})
 
-class MonteCarloRequest(BaseModel):
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, value: str | None) -> str | None:
+        return _optional_id(value)
+
+    @field_validator("stock_down_threshold", "reduce_spending_pct")
+    @classmethod
+    def valid_fraction(cls, value: float) -> float:
+        value = _finite(value, "spending_rule")
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("spending rule fractions must be between 0 and 1")
+        return value
+
+    @field_validator("years")
+    @classmethod
+    def valid_years(cls, value: int) -> int:
+        if value < 0 or value > 120:
+            raise ValueError("spending rule years must be between 0 and 120")
+        return value
+
+
+class SimParams(WireModel):
+    # A factory keeps defaults current without changing an explicitly supplied
+    # historical year in an existing saved request.
+    current_year: int = Field(default_factory=lambda: date.today().year)
+    current_age: int = 38
+    target_retirement_age: int
+    retirement_withdrawal_age: int = 60
+    plan_through_age: int = 100
+    general_inflation: float
+    tax_filing_status: str = "married_joint"
+    tax_version: str = "2025_simplified"
+    assets: list[Asset]
+    inflows: list[Stream]
+    outflows: list[Stream]
+    other_assets: list[OtherAsset] = Field(default_factory=list)
+    one_time_expenses: list[OneTimeExpense] = Field(default_factory=list)
+    return_mode: Literal["custom", "historical"] | None = None
+    historical_start_index: int | None = None
+    historical_wrap_mode: Literal["continue", "error"] = "continue"
+    # Boolean aliases are accepted for small clients; the normalized mode is
+    # still emitted in metadata so continuation is visible.
+    historical_wrap: bool | None = None
+    wrap_continuation: bool | None = None
+    custom_return_sequence: list[float] | None = None
+    dividend_yield: float = 0.01
+    sale_haircut: float = 0.10
+    property_sale_haircut: float | None = None
+    workplace_contribution_limit: float = 24500.0
+    employer_match_rate: float = 0.13
+    # Approved default: RMDs, taxable, bitcoin, pre-tax, Roth, rental,
+    # primary.  RMDs are applied by the core before discretionary draws.
+    withdrawal_order: list[str] = Field(default_factory=lambda: ["rmds", "taxable", "bitcoin", "pre_tax", "roth", "rental", "primary"])
+    allow_property_sale: bool = True
+    allow_primary_home_sale: bool = True
+    rmd_start_age: Literal[73, 75] = 73
+    # ``None`` selects the standard provisional-income treatment.  A numeric
+    # value remains available for an explicitly simplified user override.
+    social_security_taxable_fraction: float | None = None
+    spending_rules: list[SpendingRule] = Field(default_factory=list)
+    seed: int | None = 0
+    request_token: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_feature_aliases(cls, data: Any) -> Any:
+        result = _aliases(data, {
+            "end_age": "plan_through_age", "plan_end_age": "plan_through_age",
+            "simulation_mode": "return_mode", "mode": "return_mode",
+            "historical_start": "historical_start_index", "historical_return_start": "historical_start_index", "wrap_mode": "historical_wrap_mode",
+            "sale_haircut_pct": "sale_haircut", "taxable_sale_haircut": "sale_haircut",
+            "property_haircut": "property_sale_haircut", "dividend_yield_rate": "dividend_yield",
+            "withdrawal_account_order": "withdrawal_order", "rmd_age": "rmd_start_age",
+            "tax_status": "tax_filing_status", "tax_table_version": "tax_version",
+            "ss_taxable_fraction": "social_security_taxable_fraction",
+            "contribution_limit": "workplace_contribution_limit", "401k_contribution_limit": "workplace_contribution_limit",
+            "match_rate": "employer_match_rate", "employer_match": "employer_match_rate",
+            "returns": "custom_return_sequence", "return_sequence": "custom_return_sequence",
+            "custom_returns": "custom_return_sequence",
+        })
+        if isinstance(result, dict):
+            mode = result.get("return_mode")
+            if mode in {"deterministic", "custom_deterministic", "configured", "fixed"}:
+                result["return_mode"] = "custom"
+            elif mode in {"historical_contiguous", "historical_sequence", "historical_csv"}:
+                result["return_mode"] = "historical"
+            if "historical_wrap" in result and "historical_wrap_mode" not in result:
+                result["historical_wrap_mode"] = "continue" if result["historical_wrap"] else "error"
+            if "wrap_continuation" in result and "historical_wrap_mode" not in result:
+                result["historical_wrap_mode"] = "continue" if result["wrap_continuation"] else "error"
+        return result
+
+    @field_validator("general_inflation")
+    @classmethod
+    def valid_inflation(cls, value: float) -> float:
+        value = _finite(value, "general_inflation")
+        if value <= -1.0:
+            raise ValueError("general_inflation must be greater than -1")
+        return value
+
+    @field_validator("dividend_yield", "sale_haircut")
+    @classmethod
+    def valid_fraction(cls, value: float) -> float:
+        value = _finite(value, "fraction")
+        if not 0.0 <= value < 1.0:
+            raise ValueError("fraction must be between 0 and 1")
+        return value
+
+    @field_validator("employer_match_rate")
+    @classmethod
+    def valid_match_cap(cls, value: float) -> float:
+        value = _finite(value, "employer_match_rate")
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("employer_match_rate must be between 0 and 1")
+        return value
+
+    @field_validator("workplace_contribution_limit")
+    @classmethod
+    def valid_contribution_limit(cls, value: float) -> float:
+        return _nonnegative(value, "workplace_contribution_limit")
+
+    @field_validator("social_security_taxable_fraction")
+    @classmethod
+    def valid_ss_fraction(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        value = _finite(value, "social_security_taxable_fraction")
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("social_security_taxable_fraction must be between 0 and 1")
+        return value
+
+    @field_validator("property_sale_haircut")
+    @classmethod
+    def valid_property_haircut(cls, value: float | None) -> float | None:
+        if value is None:
+            return value
+        value = _finite(value, "property_sale_haircut")
+        if not 0.0 <= value < 1.0:
+            raise ValueError("property_sale_haircut must be between 0 and 1")
+        return value
+
+    @field_validator("custom_return_sequence")
+    @classmethod
+    def valid_custom_sequence(cls, value: list[float] | None) -> list[float] | None:
+        if value is None:
+            return value
+        if not value:
+            raise ValueError("custom_return_sequence must not be empty")
+        normalized = [_finite(item, "custom_return_sequence") for item in value]
+        if any(item <= -1.0 for item in normalized):
+            raise ValueError("custom_return_sequence values must be greater than -1")
+        return normalized
+
+    @field_validator("historical_start_index")
+    @classmethod
+    def valid_start_index(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("historical_start_index must be non-negative")
+        return value
+
+    @field_validator("request_token")
+    @classmethod
+    def valid_request_token(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        token = _nonblank(value, "request_token")
+        if len(token) > 128:
+            raise ValueError("request_token is too long")
+        return token
+
+    @model_validator(mode="after")
+    def validate_cross_fields(self) -> "SimParams":
+        if self.current_year < 1900 or self.current_year > 2200:
+            raise ValueError("current_year is outside the supported range")
+        if not 85 <= self.plan_through_age <= 115:
+            raise ValueError("plan_through_age must be between 85 and 115")
+        if self.current_age < 0 or self.current_age > 120:
+            raise ValueError("current_age is outside the supported range")
+        if self.target_retirement_age < self.current_age or self.target_retirement_age > self.plan_through_age:
+            raise ValueError("target_retirement_age must be between current_age and plan_through_age")
+        if self.retirement_withdrawal_age < 0 or self.retirement_withdrawal_age > self.plan_through_age:
+            raise ValueError("retirement_withdrawal_age must be between 0 and plan_through_age")
+        if not self.assets:
+            raise ValueError("assets must contain at least one item")
+        last_year = self.current_year + (self.plan_through_age - self.current_age)
+        for path, streams in (("inflows", self.inflows), ("outflows", self.outflows)):
+            for stream in streams:
+                if stream.end_year < self.current_year or stream.start_year > last_year:
+                    raise ValueError(f"{path} must overlap the modeled horizon")
+        for item in self.other_assets:
+            if item.add_year < self.current_year or item.add_year > last_year:
+                raise ValueError("other_assets add_year must fall inside the modeled horizon")
+        for item in self.one_time_expenses:
+            if item.year < self.current_year or item.year > last_year:
+                raise ValueError("one_time_expenses year must fall inside the modeled horizon")
+        collections = (("assets", self.assets), ("inflows", self.inflows), ("outflows", self.outflows), ("other_assets", self.other_assets), ("one_time_expenses", self.one_time_expenses), ("spending_rules", self.spending_rules))
+        for path, items in collections:
+            _validate_stable_ids(items, path)
+        all_explicit_ids: set[str] = set()
+        for _, items in collections:
+            for item in items:
+                item_id = getattr(item, "id", None)
+                if item_id:
+                    key = str(item_id).casefold()
+                    if key in all_explicit_ids:
+                        raise ValueError("stable IDs must be unique across the request")
+                    all_explicit_ids.add(key)
+        status = self.tax_filing_status.strip().lower().replace("-", "_").replace(" ", "_")
+        if status in {"mfj", "married", "married_filing_jointly", "joint"}:
+            status = "married_joint"
+        if status not in {"married_joint", "single"}:
+            raise ValueError("tax_filing_status must be married_joint or single")
+        object.__setattr__(self, "tax_filing_status", status)
+        version = self.tax_version.strip().lower().replace("-", "_")
+        if version in {"2025", "2025_simple", "2025_federal"}:
+            version = "2025_simplified"
+        if version != "2025_simplified":
+            raise ValueError("tax_version is unsupported")
+        object.__setattr__(self, "tax_version", version)
+        normalized_order = [_withdrawal_token(item) for item in self.withdrawal_order]
+        supported_order = {"rmds", "pre_tax", "taxable", "bitcoin", "roth", "rental", "primary"}
+        if not normalized_order or len(set(normalized_order)) != len(normalized_order):
+            raise ValueError("withdrawal_order must contain unique categories")
+        if set(normalized_order) != supported_order:
+            raise ValueError("withdrawal_order must include every supported account category exactly once")
+        object.__setattr__(self, "withdrawal_order", normalized_order)
+        if self.custom_return_sequence is not None and self.return_mode == "historical":
+            raise ValueError("custom_return_sequence cannot be used with historical return_mode")
+        return self
+
+
+def _validate_stable_ids(items: list[Any], path: str) -> None:
+    # Names are part of the old wire format and become dictionary keys in the
+    # ledger.  Case/whitespace-insensitive duplicate detection prevents a
+    # visually indistinguishable item from overwriting another one.
+    names: set[str] = set()
+    ids: set[str] = set()
+    for item in items:
+        name = getattr(item, "name", None)
+        if name is not None:
+            key = " ".join(str(name).split()).casefold()
+            if key in names:
+                raise ValueError(f"{path} names must be unique")
+            names.add(key)
+        item_id = getattr(item, "id", None)
+        if item_id:
+            key = str(item_id).casefold()
+            if key in ids:
+                raise ValueError(f"{path} IDs must be unique")
+            ids.add(key)
+
+
+class MonteCarloRequest(WireModel):
     params: SimParams
-    num_runs: int = 200
-    stock_volatility: float = 0.15
-    real_estate_volatility: float = 0.08
-    inflation_volatility: float = 0.0
-    seed: Optional[int] = None
-    spending_rule: Optional[SpendingRule] = None
-    spending_rules: Optional[List[SpendingRule]] = None
+    num_runs: int = Field(default=200, ge=1, le=MAX_MONTE_CARLO_RUNS)
+    stock_volatility: float = Field(default=0.15, ge=0.0, le=1.0)
+    real_estate_volatility: float = Field(default=0.08, ge=0.0, le=1.0)
+    inflation_volatility: float = Field(default=0.0, ge=0.0, le=1.0)
+    seed: int | None = None
+    return_mode: Literal["custom", "historical"] | None = None
+    spending_rule: SpendingRule | None = None
+    spending_rules: list[SpendingRule] | None = None
+    # An inspector may present the aggregate response fingerprint.  It is
+    # checked before calculating so it cannot silently inspect another plan.
+    fingerprint: str | None = None
+    request_token: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_fingerprint_aliases(cls, data: Any) -> Any:
+        result = _aliases(data, {
+            "requestToken": "request_token", "request_fingerprint": "fingerprint",
+            "mode": "return_mode", "simulation_mode": "return_mode", "return_source": "return_mode",
+        })
+        if isinstance(result, dict):
+            mode = result.get("return_mode")
+            if mode in {"deterministic", "custom_deterministic", "configured", "fixed"}:
+                result["return_mode"] = "custom"
+            elif mode in {"historical_contiguous", "historical_sequence", "historical_csv"}:
+                result["return_mode"] = "historical"
+        return result
+
+    @model_validator(mode="after")
+    def validate_rules(self) -> "MonteCarloRequest":
+        _validate_stable_ids(self.spending_rules or [], "spending_rules")
+        if self.spending_rule and self.spending_rules:
+            _validate_stable_ids([self.spending_rule, *self.spending_rules], "spending_rules")
+        if self.fingerprint is not None and not re.fullmatch(r"[0-9a-fA-F]{32,128}", self.fingerprint):
+            raise ValueError("fingerprint has invalid syntax")
+        if self.request_token is not None:
+            token = _nonblank(self.request_token, "request_token")
+            if len(token) > 128:
+                raise ValueError("request_token is too long")
+            # Assignment validation is enabled on the wire models.  Use the
+            # low-level setter inside this after-validator so normalizing a
+            # token does not recursively invoke the validator itself.
+            object.__setattr__(self, "request_token", token)
+        return self
 
 
+class MonteCarloRunRequest(MonteCarloRequest):
+    run_index: int = Field(default=0, ge=0)
 
-class MonteCarloRunRequest(BaseModel):
-    params: SimParams
-    run_index: int = 0
-    num_runs: int = 200
-    stock_volatility: float = 0.15
-    real_estate_volatility: float = 0.08
-    inflation_volatility: float = 0.0
-    seed: Optional[int] = None
-    spending_rule: Optional[SpendingRule] = None
-    spending_rules: Optional[List[SpendingRule]] = None
+    @model_validator(mode="after")
+    def validate_run_index(self) -> "MonteCarloRunRequest":
+        if self.run_index >= self.num_runs:
+            raise ValueError("run_index must be between 0 and num_runs - 1")
+        return self
 
 
-def _collect_spending_rules(single: Optional[SpendingRule], multiple: Optional[List[SpendingRule]]) -> List[SpendingRule]:
-    rules: List[SpendingRule] = []
+def _merged_params(params: SimParams, single: SpendingRule | None, multiple: list[SpendingRule] | None) -> SimParams:
+    rules = list(params.spending_rules)
     if multiple:
         rules.extend(multiple)
     if single:
         rules.append(single)
+    if rules:
+        _validate_stable_ids(rules, "spending_rules")
+    return params.model_copy(update={"spending_rules": rules})
+
+
+def _collect_spending_rules(single: SpendingRule | None, multiple: list[SpendingRule] | None) -> list[SpendingRule]:
+    """Compatibility helper retained for callers of the former module."""
+
+    rules = list(multiple or [])
+    if single is not None:
+        rules.append(single)
     return rules
 
 
-def _percentile(sorted_vals: List[float], p: float) -> float:
-    if not sorted_vals:
-        return 0.0
-    if p <= 0:
-        return float(sorted_vals[0])
-    if p >= 1:
-        return float(sorted_vals[-1])
-    # Linear interpolation between closest ranks
-    idx = (len(sorted_vals) - 1) * p
-    lo = int(idx)
-    hi = min(lo + 1, len(sorted_vals) - 1)
-    w = idx - lo
-    return float(sorted_vals[lo] * (1 - w) + sorted_vals[hi] * w)
-
-
-def _clamp_return(r: float) -> float:
-    # Prevent returns from making an asset go <= 0 in one step.
-    return max(-0.95, min(1.5, r))
-
-
-def _skewed_stock_shock(rng: random.Random, target_sigma: float) -> float:
-    """Return a zero-mean shock with negative skew (rare crash years).
-
-    We scale the shock so its standard deviation matches target_sigma.
-    The asset's expected return is still governed by its configured mean growth rate.
-    """
-    if not target_sigma or target_sigma <= 0:
-        return 0.0
-
-    # Simple two-regime mixture:
-    # - Most years: modest positive drift, modest volatility
-    # - Crash years: larger negative drift, higher volatility
-    # Parameters are heuristics intended to mimic "many decent years, few very bad".
-    crash_prob = 0.12
-    crash_mean = -0.35
-    crash_sigma = 0.12
-    normal_sigma = 0.08
-
-    # Choose normal_mean so the overall mean shock is ~0.
-    normal_mean = (-crash_prob * crash_mean) / (1.0 - crash_prob)
-
-    # Compute variance of the raw (unscaled) mixture distribution.
-    raw_var = (
-        (1.0 - crash_prob) * (normal_sigma ** 2 + normal_mean ** 2)
-        + crash_prob * (crash_sigma ** 2 + crash_mean ** 2)
-    )
-    if raw_var <= 0:
-        return 0.0
-    scale = target_sigma / math.sqrt(raw_var)
-
-    if rng.random() < crash_prob:
-        x = rng.gauss(crash_mean, crash_sigma)
+def _error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, HistoricalDataError):
+        status, code, message, path = 503, exc.code, exc.message, exc.path
+    elif isinstance(exc, AccountingBlocked):
+        status, code, message, path = 422, exc.code, exc.message, exc.path
     else:
-        x = rng.gauss(normal_mean, normal_sigma)
-
-    return x * scale
-
-
-def _load_yearly_returns_csv(path: Path) -> List[float]:
-    vals: List[float] = []
-    with path.open(newline='') as f:
-        r = csv.DictReader(f)
-        for row in r:
-            try:
-                vals.append(float(row['return']))
-            except Exception:
-                continue
-    return vals
+        status, code, message, path = 422, "VALIDATION_ERROR", str(exc) or "Request could not be calculated", "request"
+    return JSONResponse(status_code=status, content={"error": {"code": code, "message": message, "details": [{"path": path, "code": code, "message": message}]}})
 
 
-_HIST_STOCK_BINS_CACHE: Optional[List[tuple[float, float, float]]] = None
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "service": "holmes-engine", "version": "2.0"}
 
 
-def _get_historical_stock_return_bins(bin_size: float = 0.05) -> List[tuple[float, float, float]]:
-    """Return [(lo, hi, weight), ...] representing historical annual stock returns.
-
-    We bucket annual returns into 5% bands (default), compute frequency weights from history,
-    then Monte Carlo samples a bucket by weight and a uniform return within that bucket.
-
-    Data source is a local CSV generated from Stooq S&P 500 year-end closes:
-    backend/data/spx_yearly_price_returns_1940.csv
-
-    Note: This is price return (not total return)."""
-
-    global _HIST_STOCK_BINS_CACHE
-    if _HIST_STOCK_BINS_CACHE is not None:
-        return _HIST_STOCK_BINS_CACHE
-
-    data_path = Path(__file__).resolve().parent / 'data' / 'spx_yearly_price_returns_1940.csv'
-    if not data_path.exists():
-        # Fall back to the previous skewed model if the dataset isn't present.
-        _HIST_STOCK_BINS_CACHE = []
-        return _HIST_STOCK_BINS_CACHE
-
-    vals = _load_yearly_returns_csv(data_path)
-    if not vals:
-        _HIST_STOCK_BINS_CACHE = []
-        return _HIST_STOCK_BINS_CACHE
-
-    # Build integer bin index k where bucket is [k*bin_size, (k+1)*bin_size)
-    counts: dict[int, int] = {}
-    for v in vals:
-        k = math.floor(v / bin_size)
-        counts[k] = counts.get(k, 0) + 1
-
-    total = sum(counts.values())
-    bins: List[tuple[float, float, float]] = []
-    for k in sorted(counts.keys()):
-        lo = k * bin_size
-        hi = (k + 1) * bin_size
-        w = counts[k] / total if total > 0 else 0.0
-        if w > 0:
-            bins.append((float(lo), float(hi), float(w)))
-
-    # Normalize weights defensively
-    wsum = sum(w for _, _, w in bins)
-    if wsum > 0:
-        bins = [(lo, hi, w / wsum) for (lo, hi, w) in bins]
-
-    _HIST_STOCK_BINS_CACHE = bins
-    return _HIST_STOCK_BINS_CACHE
-
-
-def _sample_historical_stock_return(rng: random.Random) -> Optional[float]:
-    bins = _get_historical_stock_return_bins()
-    if not bins:
-        return None
-
-    u = rng.random()
-    acc = 0.0
-    for lo, hi, w in bins:
-        acc += w
-        if u <= acc:
-            return rng.uniform(lo, hi)
-    lo, hi, _ = bins[-1]
-    return rng.uniform(lo, hi)
-
-
-def _simulate_timeline_with_random_returns(
-    params: SimParams,
-    rng: random.Random,
-    stock_vol: float,
-    real_estate_vol: float,
-    inflation_vol: float,
-    emit_timeline: bool = True,
-    spending_rules: Optional[List[SpendingRule]] = None,
-) -> tuple[List[dict], bool, List[float], Optional[int], List[float], List[float]]:
-    # This mirrors /simulate, but applies random returns PER YEAR when growing assets.
-    timeline = []
-    ever_unfunded_before_95 = False
-    first_failure_year: Optional[int] = None
-
-    nominal_net_worth_series: List[float] = []
-    expenses_series: List[float] = []
-
-    stock_returns: List[float] = []
-
-    last_stock_return: Optional[float] = None
-    spending_reduction_years_remaining = 0
-    spending_reduction_pct = 0.0
-    spending_rules_sorted = sorted(
-        (spending_rules or []),
-        key=lambda r: max(0.0, float(r.stock_down_threshold or 0.0)),
-        reverse=True,
-    )
-
-    portfolio = {a.name: a.value for a in params.assets}
-    asset_types = {a.name: a.tax_treatment for a in params.assets}
-
-    # Track rental equity percentage
-    rental_portfolio_pct = 1.0
-
-    year = params.current_year
-    age = params.current_age
-
-    freedom_achieved = False
-    freedom_year = None
-
-    # We keep the existing model's inflation for expense growth and bracket indexing,
-    # but allow optional *per-year* inflation noise (default disabled).
-    base_inflation = params.general_inflation
-
-    stock_index_value = 1.0
-    stock_index_peak = 1.0
-    consecutive_down_years = 0
-
-    while age <= 95:
-        years_passed = year - params.current_year
-        inflation_for_year = base_inflation
-        if inflation_vol and inflation_vol > 0:
-            inflation_for_year = max(-0.02, min(0.15, rng.gauss(base_inflation, inflation_vol)))
-
-        inflation_mult = (1 + base_inflation) ** years_passed
-
-        # 1. ADD ONE-TIME ASSETS
-        for oa in params.other_assets:
-            if oa.add_year == year and oa.value > 0:
-                target = next((n for n, t in asset_types.items() if t == 'taxable'), None)
-                if target:
-                    portfolio[target] += oa.value
-
-        # 1b. APPLY ONE-TIME EXPENSES (optionally convert to Primary Home equity)
-        one_time_expenses_total = 0.0
-        for exp in params.one_time_expenses:
-            if exp.year == year and exp.amount > 0:
-                one_time_expenses_total += exp.amount
-                if exp.add_to_primary_home:
-                    primary = next((n for n in portfolio.keys() if 'primary' in n.lower()), None)
-                    if primary:
-                        portfolio[primary] += exp.amount
-
-        # 2. CALCULATE TARGET EXPENSES
-        target_expenses = one_time_expenses_total
-
-        # MC-only spending rule: if last year's stock return is down by threshold,
-        # reduce recurring spending for the next N years. Higher thresholds override lower ones.
-        triggered_rule = None
-        if spending_rules_sorted and last_stock_return is not None:
-            for rule in spending_rules_sorted:
-                threshold = max(0.0, float(rule.stock_down_threshold or 0.0))
-                if threshold <= 0:
-                    continue
-                if float(last_stock_return) <= -threshold:
-                    triggered_rule = rule
-                    break
-
-        if triggered_rule is not None:
-            next_reduce_pct = max(0.0, min(1.0, float(triggered_rule.reduce_spending_pct or 0.0)))
-            next_years = max(0, int(triggered_rule.years or 0))
-            if next_reduce_pct > 0 and next_years > 0:
-                same_or_more_severe = next_reduce_pct >= spending_reduction_pct
-                if spending_reduction_years_remaining <= 0 or same_or_more_severe:
-                    # Reset the countdown only when the new cut is at least as severe as the current one.
-                    spending_reduction_pct = next_reduce_pct
-                    spending_reduction_years_remaining = next_years
-
-        recurring_spend_mult = 1.0
-        if spending_reduction_years_remaining > 0 and spending_reduction_pct > 0:
-            recurring_spend_mult = 1.0 - spending_reduction_pct
-
-        recurring_outflows = 0.0
-        for out in params.outflows:
-            if out.start_year <= year <= out.end_year:
-                rate = out.growth_rate if out.growth_rate is not None else inflation_for_year
-                recurring_outflows += out.amount * ((1 + rate) ** years_passed)
-        target_expenses += (recurring_outflows * recurring_spend_mult)
-
-        # 3. INCOME BUCKETS
-        inc_tracker = {
-            "w2_income": 0, "rental_income": 0, "royalty_income": 0,
-            "dividend_income": 0, "social_security": 0, "retirement_withdrawals": 0,
-            "brokerage_withdrawals": 0, "bitcoin_withdrawals": 0, "roth_withdrawals": 0,
-            "other_income": 0
-        }
-
-        # A. Inflows
-        for stream in params.inflows:
-            if stream.start_year <= year <= stream.end_year:
-                rate = stream.growth_rate if stream.growth_rate is not None else inflation_for_year
-                amt = stream.amount * ((1 + rate) ** years_passed)
-
-                nl = stream.name.lower()
-                if "w2" in nl or "salary" in nl:
-                    inc_tracker["w2_income"] += amt
-                elif "rental" in nl:
-                    inc_tracker["rental_income"] += amt * rental_portfolio_pct
-                elif "royalt" in nl:
-                    inc_tracker["royalty_income"] += amt
-                elif "social" in nl:
-                    inc_tracker["social_security"] += amt
-                else:
-                    inc_tracker["other_income"] += amt
-
-        # B. 401k Contributions (employee + employer match)
-        # Only if there's W2 income this year
-        employee_401k_contribution = 0.0
-        employer_401k_match = 0.0
-        if inc_tracker["w2_income"] > 0:
-            # Inflation-adjusted contribution limit ($24,500 base in 2025)
-            contribution_limit = 24500.0 * ((1 + base_inflation) ** years_passed)
-            # Employee contributes up to the limit
-            employee_401k_contribution = min(inc_tracker["w2_income"], contribution_limit)
-            # Employer matches 100% up to 13% of W2 salary
-            max_employer_match = inc_tracker["w2_income"] * 0.13
-            employer_401k_match = min(employee_401k_contribution, max_employer_match)
-            # Add both to 401k
-            pretax_account = next((n for n, t in asset_types.items() if t == 'pre_tax'), None)
-            if pretax_account:
-                portfolio[pretax_account] += employee_401k_contribution + employer_401k_match
-
-        # C. Dividends
-        # Dividends are modeled as a cashflow from taxable brokerage stocks.
-        # Roth and 401k returns are handled via their growth_rate (i.e., dividends are effectively reinvested there).
-        div_base = sum(
-            v
-            for n, v in portfolio.items()
-            if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower()
+@app.post("/simulate")
+def run_simulation(params: SimParams):
+    try:
+        mode = params.return_mode or "custom"
+        result = simulate_one(params, mode=mode)
+        token = request_fingerprint(
+            params,
+            mode=mode,
+            num_runs=1,
+            stock_volatility=0.0,
+            real_estate_volatility=0.0,
+            inflation_volatility=0.0,
+            seed=params.seed,
         )
-        inc_tracker["dividend_income"] = div_base * 0.011
-
-        # D. RMDs
-        rmd_total = 0
-        div = get_rmd_divisor(age)
-        if div > 0:
-            for n, v in portfolio.items():
-                if asset_types[n] == 'pre_tax' and v > 0:
-                    rmd = v / div
-                    portfolio[n] -= rmd
-                    rmd_total += rmd
-        inc_tracker["retirement_withdrawals"] += rmd_total
-
-        # 4. TAX CALCULATION (Initial)
-        # Subtract employee 401k contribution from taxable W2 income (pre-tax)
-        taxable_w2 = inc_tracker["w2_income"] - employee_401k_contribution
-        taxable_income = (
-            taxable_w2 + inc_tracker["rental_income"] +
-            inc_tracker["royalty_income"] + inc_tracker["dividend_income"] +
-            inc_tracker["social_security"] + inc_tracker["retirement_withdrawals"] +
-            inc_tracker["other_income"]
-        )
-
-        tax_bill = calculate_federal_tax(taxable_income, years_passed=years_passed, inflation=base_inflation)
-        mandatory_net = taxable_income - tax_bill
-
-        # 5. GAP ANALYSIS (with epsilon)
-        surplus = mandatory_net - target_expenses
-        surplus_epsilon = 1.0
-        fully_funded = False
-
-        if surplus >= -surplus_epsilon:
-            if surplus > surplus_epsilon:
-                target = next((n for n, t in asset_types.items() if t == 'taxable' and 'bitcoin' not in n.lower()), None)
-                if not target:
-                    target = next((n for n, t in asset_types.items() if t == 'taxable'), None)
-                if target:
-                    portfolio[target] += surplus
-            fully_funded = True
-        else:
-            needed = abs(surplus)
-
-            # If we've reached the configured withdrawal age, prefer tapping pre-tax
-            # retirement accounts first (instead of waiting until other sources are exhausted).
-            if needed > 0.1 and age >= params.retirement_withdrawal_age:
-                for n, v in portfolio.items():
-                    if asset_types[n] == 'pre_tax' and v > 0:
-                        gross = needed / 0.75
-                        take = min(gross, v)
-                        portfolio[n] -= take
-                        inc_tracker["retirement_withdrawals"] += take
-                        taxable_income += take
-                        needed -= (take * 0.75)
-                        if needed <= 0.1:
-                            break
-
-
-            # 1. Brokerage Stocks
-            if needed > 0:
-                for n, v in portfolio.items():
-                    if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower() and v > 0:
-                        gross = needed / TAXABLE_SALE_NET_FACTOR
-                        take = min(gross, v)
-                        portfolio[n] -= take
-                        inc_tracker["brokerage_withdrawals"] += take
-                        needed -= (take * TAXABLE_SALE_NET_FACTOR)
-                        if needed <= 0.1:
-                            break
-
-            # 2. Bitcoin
-            if needed > 0.1:
-                for n, v in portfolio.items():
-                    if 'bitcoin' in n.lower() and v > 0:
-                        gross = needed / TAXABLE_SALE_NET_FACTOR
-                        take = min(gross, v)
-                        portfolio[n] -= take
-                        inc_tracker["bitcoin_withdrawals"] += take
-                        needed -= (take * TAXABLE_SALE_NET_FACTOR)
-                        if needed <= 0.1:
-                            break
-            # 4. Rental Equity
-            if needed > 0.1:
-                for n, v in portfolio.items():
-                    if asset_types[n] == 'real_estate' and 'primary' not in n.lower() and v > 0:
-                        gross = needed / TAXABLE_SALE_NET_FACTOR
-                        take = min(gross, v)
-
-                        pre_sale_value = v + take
-                        portfolio[n] -= take
-                        if pre_sale_value > 0:
-                            pct_sold = take / pre_sale_value
-                            rental_portfolio_pct *= (1 - pct_sold)
-
-                        inc_tracker["brokerage_withdrawals"] += take
-                        needed -= (take * TAXABLE_SALE_NET_FACTOR)
-                        if needed <= 0.1:
-                            break
-
-            # 5. Roth
-            if needed > 0.1:
-                for n, v in portfolio.items():
-                    if asset_types[n] == 'roth' and v > 0:
-                        take = min(needed, v)
-                        portfolio[n] -= take
-                        inc_tracker["roth_withdrawals"] += take
-                        needed -= take
-                        if needed <= 0.1:
-                            break
-
-            if needed <= 1.0:
-                fully_funded = True
-
-        # Monte Carlo success metric: any single unfunded year before age 95 is a failure.
-        # "Before I turn 95" => ages 0..94.
-        if age < 95 and not fully_funded:
-            ever_unfunded_before_95 = True
-            if first_failure_year is None:
-                first_failure_year = year
-
-        # 6. RE-CALCULATE TAXES (Final)
-        final_tax = calculate_federal_tax(taxable_income, years_passed=years_passed, inflation=base_inflation)
-        effective_tax_rate = final_tax / taxable_income if taxable_income > 0 else 0
-
-        total_assets = sum(portfolio.values())
-        nominal_net_worth_series.append(float(round(total_assets, 0)))
-        expenses_series.append(float(round(target_expenses, 0)))
-
-        if emit_timeline:
-            after_tax = {
-                "w2_income_after_tax": inc_tracker["w2_income"] * (1 - effective_tax_rate),
-                "rental_income_after_tax": inc_tracker["rental_income"] * (1 - effective_tax_rate),
-                "royalty_income_after_tax": inc_tracker["royalty_income"] * (1 - effective_tax_rate),
-                "dividend_income_after_tax": inc_tracker["dividend_income"] * (1 - effective_tax_rate),
-                "social_security_after_tax": inc_tracker["social_security"] * (1 - effective_tax_rate),
-                "retirement_withdrawals_after_tax": inc_tracker["retirement_withdrawals"] * (1 - effective_tax_rate),
-                "brokerage_withdrawals_after_tax": inc_tracker["brokerage_withdrawals"] * TAXABLE_SALE_NET_FACTOR,
-                "bitcoin_withdrawals_after_tax": inc_tracker["bitcoin_withdrawals"] * TAXABLE_SALE_NET_FACTOR,
-                "roth_withdrawals_after_tax": inc_tracker["roth_withdrawals"],
-            }
-
-            # Tax breakdown (used for stacking taxes into the expenses chart)
-            income_tax_total = float(final_tax)
-            tax_brokerage = float(inc_tracker["brokerage_withdrawals"]) * TAXABLE_SALE_TAX_RATE
-            tax_bitcoin = float(inc_tracker["bitcoin_withdrawals"]) * TAXABLE_SALE_TAX_RATE
-
-            taxable_components = {
-                "tax_w2": float(max(0.0, taxable_w2)),
-                "tax_rental": float(max(0.0, inc_tracker["rental_income"])),
-                "tax_royalty": float(max(0.0, inc_tracker["royalty_income"])),
-                "tax_dividend": float(max(0.0, inc_tracker["dividend_income"])),
-                "tax_social_security": float(max(0.0, inc_tracker["social_security"])),
-                "tax_retirement": float(max(0.0, inc_tracker["retirement_withdrawals"])),
-                "tax_other": float(max(0.0, inc_tracker["other_income"])),
-            }
-
-            if taxable_income > 0 and income_tax_total > 0:
-                for k, amt in taxable_components.items():
-                    taxable_components[k] = income_tax_total * (amt / taxable_income)
-            else:
-                for k in taxable_components:
-                    taxable_components[k] = 0.0
-
-            tax_total = income_tax_total + tax_brokerage + tax_bitcoin
-
-            if surplus < -surplus_epsilon and fully_funded:
-                current_total = sum(after_tax.values())
-                if current_total > 0:
-                    correction_ratio = target_expenses / current_total
-                    for k in after_tax:
-                        after_tax[k] *= correction_ratio
-
-            asset_bk = {
-                "retirement_traditional": sum(v for n, v in portfolio.items() if asset_types[n] == 'pre_tax'),
-                "retirement_roth": sum(v for n, v in portfolio.items() if asset_types[n] == 'roth'),
-                "brokerage": sum(v for n, v in portfolio.items() if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower()),
-                "bitcoin": sum(v for n, v in portfolio.items() if 'bitcoin' in n.lower()),
-                "rental_properties": sum(v for n, v in portfolio.items() if asset_types[n] == 'real_estate' and 'primary' not in n.lower()),
-                "primary_home": sum(v for n, v in portfolio.items() if 'primary' in n.lower()),
-            }
-
-            passive_gross = (
-                inc_tracker["rental_income"] + inc_tracker["dividend_income"] +
-                inc_tracker["royalty_income"] + inc_tracker["social_security"] +
-                inc_tracker["retirement_withdrawals"]
-            )
-            if passive_gross * (1 - effective_tax_rate) > target_expenses and not freedom_achieved:
-                freedom_achieved = True
-                freedom_year = year
-
-            timeline.append({
-                "year": year,
-                "age": age,
-                "nominal_net_worth": round(total_assets, 0),
-                "real_net_worth": round(total_assets / inflation_mult, 0),
-                "total_expenses": round(target_expenses, 0),
-                "tax_income_total": round(income_tax_total, 0),
-                "tax_brokerage": round(tax_brokerage, 0),
-                "tax_bitcoin": round(tax_bitcoin, 0),
-                "tax_total": round(tax_total, 0),
-                "tax_w2": round(taxable_components["tax_w2"], 0),
-                "tax_rental": round(taxable_components["tax_rental"], 0),
-                "tax_royalty": round(taxable_components["tax_royalty"], 0),
-                "tax_dividend": round(taxable_components["tax_dividend"], 0),
-                "tax_social_security": round(taxable_components["tax_social_security"], 0),
-                "tax_retirement": round(taxable_components["tax_retirement"], 0),
-                "tax_other": round(taxable_components["tax_other"], 0),
-                **after_tax,
-                **asset_bk
-            })
-
-        # Apply random returns for this YEAR (not fixed per run)
-        # Stocks: sample from a historical distribution (5% buckets since 1940).
-        # No mean-shifting to the user-entered stock growth rate.
-        sampled_stock = _sample_historical_stock_return(rng)
-        if sampled_stock is None:
-            # Fallback to prior skewed model if historical data isn't available.
-            stock_shock = _skewed_stock_shock(rng, stock_vol)
-            sampled_stock = stock_shock
-
-        re_shock = rng.gauss(0.0, real_estate_vol) if real_estate_vol and real_estate_vol > 0 else 0.0
-
-        # Apply caps so the simulated market never draws down more than 50% from its peak.
-        realized = _clamp_return(sampled_stock)
-        candidate_index = stock_index_value * (1 + realized)
-        min_allowed_index = stock_index_peak * 0.5
-        if candidate_index < min_allowed_index:
-            realized = min_allowed_index / stock_index_value - 1
-            candidate_index = min_allowed_index
-
-        if realized < 0:
-            if consecutive_down_years >= 3:
-                realized = 0.0
-                candidate_index = stock_index_value
-                consecutive_down_years = 0
-            else:
-                consecutive_down_years += 1
-        else:
-            consecutive_down_years = 0
-
-        stock_index_value = candidate_index
-        stock_index_peak = max(stock_index_peak, stock_index_value)
-
-        # Record the realized "stock market" return for this year (for charting).
-        last_stock_return = realized
-        stock_returns.append(last_stock_return)
-
-        means = {a.name: a.growth_rate for a in params.assets}
-        for n, v in list(portfolio.items()):
-            mean = float(means.get(n, 0.0))
-            t = asset_types.get(n, 'taxable')
-            name_lower = n.lower()
-
-            if t == 'real_estate':
-                realized = _clamp_return(mean + re_shock)
-            elif 'bitcoin' in name_lower:
-                # Keep bitcoin as its own process around its configured mean.
-                btc_shock = rng.gauss(0.0, stock_vol) if stock_vol and stock_vol > 0 else 0.0
-                realized = _clamp_return(mean + btc_shock)
-            else:
-                # Stocks/bonds/etc: use the sampled historical stock market return.
-                realized = _clamp_return(sampled_stock)
-
-            portfolio[n] = v * (1 + realized)
-
-        if spending_reduction_years_remaining > 0:
-            spending_reduction_years_remaining -= 1
-            if spending_reduction_years_remaining == 0:
-                spending_reduction_pct = 0.0
-
-        year += 1
-        age += 1
-
-    return timeline, (not ever_unfunded_before_95), stock_returns, first_failure_year, nominal_net_worth_series, expenses_series
+        result["fingerprint"] = token
+        result["resultToken"] = token
+        result["requestToken"] = params.request_token or token
+        result["request_token"] = params.request_token or token
+        result["request_fingerprint"] = token
+        return result
+    except (AccountingBlocked, HistoricalDataError, ValueError) as exc:
+        return _error_response(exc)
 
 
 @app.post("/monte_carlo")
-def monte_carlo(req: MonteCarloRequest):
-    params = req.params
-    num_runs = max(1, min(int(req.num_runs), 100000))
-    stock_vol = max(0.0, float(req.stock_volatility))
-    re_vol = max(0.0, float(req.real_estate_volatility))
-    infl_vol = max(0.0, float(req.inflation_volatility))
-    spending_rules = _collect_spending_rules(req.spending_rule, req.spending_rules)
-
-    # Use a master RNG and derive an independent per-run seed so individual runs
-    # can be reproduced (and inspected) by run_index.
-    master_rng = random.Random(req.seed) if req.seed is not None else random.Random()
-
-    ages = list(range(int(params.current_age), 96))
-    years = [int(params.current_year) + (age - int(params.current_age)) for age in ages]
-
-    # Aggregate values per time step without keeping all timelines in memory.
-    nw_values_by_i: List[List[float]] = [[] for _ in ages]
-    stock_values_by_i: List[List[float]] = [[] for _ in ages]
-    expense_values_by_i: List[List[float]] = [[] for _ in ages]
-    success = 0
-    run_outcomes: List[bool] = []
-    for _ in range(num_runs):
-        run_seed = master_rng.getrandbits(64)
-        run_rng = random.Random(run_seed)
-        _, is_success, stock_returns, _, nw_series, exp_series = _simulate_timeline_with_random_returns(
-            params, run_rng, stock_vol, re_vol, infl_vol, emit_timeline=False, spending_rules=spending_rules
-        )
-
-        run_outcomes.append(bool(is_success))
-
-        n = min(len(ages), len(nw_series), len(stock_returns), len(exp_series))
-        for i in range(n):
-            nw_values_by_i[i].append(float(nw_series[i]))
-            stock_values_by_i[i].append(float(stock_returns[i]))
-            expense_values_by_i[i].append(float(exp_series[i]))
-
-        if is_success:
-            success += 1
-
-    if num_runs <= 0 or not ages:
-        return {"percentileData": [], "successRate": 0.0, "numRuns": 0, "seed": req.seed}
-
-    # Success rate is computed from "no unfunded year before age 95" (see helper).
-
-    percentile_data = []
-    for i, age in enumerate(ages):
-        vals = nw_values_by_i[i]
-        vals.sort()
-        mean = sum(vals) / len(vals) if vals else 0.0
-        percentile_data.append({
-            "age": age,
-            "year": years[i],
-            "p10": _percentile(vals, 0.10),
-            "p25": _percentile(vals, 0.25),
-            "p50": _percentile(vals, 0.50),
-            "p75": _percentile(vals, 0.75),
-            "p90": _percentile(vals, 0.90),
-            "mean": mean,
-        })
-
-    # Stock return distribution by year (box + whiskers)
-    stock_return_box_data = []
-    if stock_values_by_i and ages:
-        for i, age in enumerate(ages):
-            year_returns = stock_values_by_i[i]
-            year_returns.sort()
-            if not year_returns:
-                continue
-            stock_return_box_data.append({
-                "age": age,
-                "year": years[i],
-                "min": float(year_returns[0]),
-                "q1": _percentile(year_returns, 0.25),
-                "median": _percentile(year_returns, 0.50),
-                "q3": _percentile(year_returns, 0.75),
-                "max": float(year_returns[-1]),
-                "p10": _percentile(year_returns, 0.10),
-                "p90": _percentile(year_returns, 0.90),
-            })
-
-    # Expense distribution by year
-    expense_percentile_data = []
-    for i, age in enumerate(ages):
-        vals = expense_values_by_i[i]
-        vals.sort()
-        mean = sum(vals) / len(vals) if vals else 0.0
-        expense_percentile_data.append({
-            "age": age,
-            "year": years[i],
-            "p10": _percentile(vals, 0.10),
-            "p25": _percentile(vals, 0.25),
-            "p50": _percentile(vals, 0.50),
-            "p75": _percentile(vals, 0.75),
-            "p90": _percentile(vals, 0.90),
-            "mean": mean,
-        })
-
-    return {
-        "percentileData": percentile_data,
-        "stockReturnBoxData": stock_return_box_data,
-        "expensePercentileData": expense_percentile_data,
-        "successRate": (success / num_runs) * 100.0,
-        "numRuns": num_runs,
-        "seed": req.seed,
-        "runOutcomes": run_outcomes,
-    }
+def run_monte_carlo(req: MonteCarloRequest):
+    try:
+        params = _merged_params(req.params, req.spending_rule, req.spending_rules)
+        mode = req.return_mode or params.return_mode or ("custom" if params.custom_return_sequence else "historical")
+        effective_seed = req.seed if req.seed is not None else params.seed
+        result = monte_carlo(params, num_runs=req.num_runs, stock_volatility=req.stock_volatility, real_estate_volatility=req.real_estate_volatility, inflation_volatility=req.inflation_volatility, seed=effective_seed, mode=mode)
+        result["fingerprint"] = request_fingerprint(params, mode=mode, num_runs=req.num_runs, stock_volatility=req.stock_volatility, real_estate_volatility=req.real_estate_volatility, inflation_volatility=req.inflation_volatility, seed=effective_seed)
+        result["resultToken"] = result["fingerprint"]
+        result["requestToken"] = req.request_token or result["fingerprint"]
+        result["request_token"] = req.request_token or result["fingerprint"]
+        result["request_fingerprint"] = result["fingerprint"]
+        return result
+    except (AccountingBlocked, HistoricalDataError, ValueError) as exc:
+        return _error_response(exc)
 
 
 @app.post("/monte_carlo_run")
-def monte_carlo_run(req: MonteCarloRunRequest):
-    params = req.params
-    num_runs = max(1, min(int(req.num_runs), 100000))
-    idx = int(req.run_index)
-    if idx < 0:
-        idx = 0
-    spending_rules = _collect_spending_rules(req.spending_rule, req.spending_rules)
-    if idx >= num_runs:
-        idx = num_runs - 1
+def run_monte_carlo_inspector(req: MonteCarloRunRequest):
+    try:
+        params = _merged_params(req.params, req.spending_rule, req.spending_rules)
+        mode = req.return_mode or params.return_mode or ("custom" if params.custom_return_sequence else "historical")
+        effective_seed = req.seed if req.seed is not None else params.seed
+        expected = request_fingerprint(params, mode=mode, num_runs=req.num_runs, stock_volatility=req.stock_volatility, real_estate_volatility=req.real_estate_volatility, inflation_volatility=req.inflation_volatility, seed=effective_seed)
+        if req.fingerprint is not None and req.fingerprint != expected:
+            return _error_response(AccountingBlocked("FINGERPRINT_MISMATCH", "The inspector request does not match the aggregate Monte Carlo plan", path="fingerprint"))
+        result = monte_carlo_run(params, run_index=req.run_index, num_runs=req.num_runs, stock_volatility=req.stock_volatility, real_estate_volatility=req.real_estate_volatility, inflation_volatility=req.inflation_volatility, seed=effective_seed, mode=mode)
+        result["fingerprint"] = expected
+        result["resultToken"] = expected
+        result["requestToken"] = req.request_token or expected
+        result["request_token"] = req.request_token or expected
+        result["request_fingerprint"] = expected
+        return result
+    except (AccountingBlocked, HistoricalDataError, ValueError) as exc:
+        return _error_response(exc)
 
-    stock_vol = max(0.0, float(req.stock_volatility))
-    re_vol = max(0.0, float(req.real_estate_volatility))
-    infl_vol = max(0.0, float(req.inflation_volatility))
 
-    master_rng = random.Random(req.seed) if req.seed is not None else random.Random()
-    run_seed = None
-    for _ in range(idx + 1):
-        run_seed = master_rng.getrandbits(64)
-    run_rng = random.Random(run_seed)
-
-    tl, is_success, stock_returns, first_failure_year, _, _ = _simulate_timeline_with_random_returns(
-        params, run_rng, stock_vol, re_vol, infl_vol, emit_timeline=True, spending_rules=spending_rules
-    )
-
-    stock_series = []
-    for i in range(min(len(tl), len(stock_returns))):
-        stock_series.append({
-            "age": tl[i].get("age"),
-            "year": tl[i].get("year"),
-            "stock_return": float(stock_returns[i]),
-        })
-
-    return {
-        "runIndex": idx,
-        "numRuns": num_runs,
-        "seed": req.seed,
-        "isSuccess": bool(is_success),
-        "firstFailureYear": first_failure_year,
-        "timeline": tl,
-        "stockReturnSeries": stock_series,
-    }
-
-# --- HELPER: FEDERAL TAX CALCULATOR (Inflation Adjusted) ---
-def calculate_federal_tax(taxable_income: float, years_passed: int = 0, inflation: float = 0.0) -> float:
-    inflation_factor = (1 + (inflation or 0.0)) ** max(0, years_passed)
-    
-    std_deduction_base = 29200
-    brackets_base = [
-        (23200, 0.10),
-        (94300, 0.12),
-        (201050, 0.22),
-        (383900, 0.24),
-        (487450, 0.32),
-        (731200, 0.35),
-    ]
-
-    std_deduction = std_deduction_base * inflation_factor
-    income = max(0.0, taxable_income - std_deduction)
-
-    tax = 0.0
-    prev_limit = 0.0
-    for limit_base, rate in brackets_base:
-        limit = limit_base * inflation_factor
-        if income <= prev_limit:
-            break
-        amt = min(income, limit) - prev_limit
-        tax += amt * rate
-        prev_limit = limit
-
-    if income > prev_limit:
-        tax += (income - prev_limit) * 0.37
-
-    return tax
-
-# --- HELPER: RMD FACTOR ---
-def get_rmd_divisor(age: int) -> float:
-    if age < 73: return 0
-    table = {
-        73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0, 79: 21.1, 80: 20.2,
-        81: 19.4, 82: 18.5, 83: 17.7, 84: 16.8, 85: 16.0, 86: 15.2, 87: 14.4, 88: 13.7,
-        89: 12.9, 90: 12.2, 91: 11.5, 92: 10.8, 93: 10.1, 94: 9.5, 95: 8.9, 96: 8.4
-    }
-    return table.get(age, 8.0)
-
-# --- THE ENGINE ---
-@app.post("/simulate")
-def run_simulation(params: SimParams):
-    timeline = []
-    
-    portfolio = {a.name: a.value for a in params.assets}
-    asset_types = {a.name: a.tax_treatment for a in params.assets}
-
-    # Track rental equity percentage
-    rental_portfolio_pct = 1.0
-    
-    year = params.current_year
-    age = params.current_age
-    freedom_achieved = False
-    freedom_year = None
-    
-    while age <= 95:
-        years_passed = year - params.current_year
-        inflation_mult = (1 + params.general_inflation) ** years_passed
-
-        # 1. ADD ONE-TIME ASSETS
-        for oa in params.other_assets:
-            if oa.add_year == year and oa.value > 0:
-                target = next((n for n, t in asset_types.items() if t == 'taxable'), None)
-                if target: portfolio[target] += oa.value
-
-        # 1b. APPLY ONE-TIME EXPENSES (optionally convert to Primary Home equity)
-        one_time_expenses_total = 0.0
-        for exp in params.one_time_expenses:
-            if exp.year == year and exp.amount > 0:
-                one_time_expenses_total += exp.amount
-                if exp.add_to_primary_home:
-                    primary = next((n for n in portfolio.keys() if 'primary' in n.lower()), None)
-                    if primary:
-                        portfolio[primary] += exp.amount
-
-        # 2. CALCULATE TARGET EXPENSES
-        target_expenses = one_time_expenses_total
-        for out in params.outflows:
-            if out.start_year <= year <= out.end_year:
-                rate = out.growth_rate if out.growth_rate is not None else params.general_inflation
-                target_expenses += out.amount * ((1 + rate) ** years_passed)
-
-        # 3. INCOME BUCKETS
-        inc_tracker = {
-            "w2_income": 0, "rental_income": 0, "royalty_income": 0,
-            "dividend_income": 0, "social_security": 0, "retirement_withdrawals": 0,
-            "brokerage_withdrawals": 0, "bitcoin_withdrawals": 0, "roth_withdrawals": 0,
-            "other_income": 0
-        }
-        
-        # A. Inflows
-        for stream in params.inflows:
-            if stream.start_year <= year <= stream.end_year:
-                rate = stream.growth_rate if stream.growth_rate is not None else params.general_inflation
-                amt = stream.amount * ((1 + rate) ** years_passed)
-                
-                nl = stream.name.lower()
-                if "w2" in nl or "salary" in nl: inc_tracker["w2_income"] += amt
-                elif "rental" in nl: 
-                    inc_tracker["rental_income"] += amt * rental_portfolio_pct
-                elif "royalt" in nl: inc_tracker["royalty_income"] += amt
-                elif "social" in nl: inc_tracker["social_security"] += amt
-                else: inc_tracker["other_income"] += amt
-
-        # B. 401k Contributions (employee + employer match)
-        # Only if there's W2 income this year
-        employee_401k_contribution = 0.0
-        employer_401k_match = 0.0
-        if inc_tracker["w2_income"] > 0:
-            # Inflation-adjusted contribution limit ($24,500 base in 2025)
-            contribution_limit = 24500.0 * ((1 + params.general_inflation) ** years_passed)
-            # Employee contributes up to the limit
-            employee_401k_contribution = min(inc_tracker["w2_income"], contribution_limit)
-            # Employer matches 100% up to 13% of W2 salary
-            max_employer_match = inc_tracker["w2_income"] * 0.13
-            employer_401k_match = min(employee_401k_contribution, max_employer_match)
-            # Add both to 401k
-            pretax_account = next((n for n, t in asset_types.items() if t == 'pre_tax'), None)
-            if pretax_account:
-                portfolio[pretax_account] += employee_401k_contribution + employer_401k_match
-
-        # B. Dividends
-        # Dividends are modeled as a cashflow from taxable brokerage stocks.
-        # Roth and 401k returns are handled via their growth_rate (i.e., dividends are effectively reinvested there).
-        div_base = sum(
-            v
-            for n, v in portfolio.items()
-            if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower()
-        )
-        inc_tracker["dividend_income"] = div_base * 0.011
-        
-        # D. RMDs
-        rmd_total = 0
-        div = get_rmd_divisor(age)
-        if div > 0:
-            for n, v in portfolio.items():
-                if asset_types[n] == 'pre_tax' and v > 0:
-                    rmd = v / div
-                    portfolio[n] -= rmd
-                    rmd_total += rmd
-        inc_tracker["retirement_withdrawals"] += rmd_total
-
-        # 4. TAX CALCULATION (Initial)
-        # Subtract employee 401k contribution from taxable W2 income (pre-tax)
-        taxable_w2 = inc_tracker["w2_income"] - employee_401k_contribution
-        taxable_income = (taxable_w2 + inc_tracker["rental_income"] + 
-                          inc_tracker["royalty_income"] + inc_tracker["dividend_income"] + 
-                          inc_tracker["social_security"] + inc_tracker["retirement_withdrawals"] + 
-                          inc_tracker["other_income"])
-        
-        tax_bill = calculate_federal_tax(taxable_income, years_passed=years_passed, inflation=params.general_inflation)
-        mandatory_net = taxable_income - tax_bill
-        
-        # 5. GAP ANALYSIS
-        # Use a small epsilon to avoid float-noise flipping us into the deficit path.
-        # This prevents tiny negative values (e.g. -0.01) from triggering withdrawals
-        # and chart normalization that can make income look "capped" at expenses.
-        surplus = mandatory_net - target_expenses
-        surplus_epsilon = 1.0  # dollars
-        
-        # Check if we successfully funded the year
-        # (Start assuming we have a deficit, prove otherwise)
-        fully_funded = False
-
-        if surplus >= -surplus_epsilon:
-            # Surplus (or effectively balanced). Only reinvest if meaningfully positive.
-            if surplus > surplus_epsilon:
-                target = next((n for n, t in asset_types.items() if t == 'taxable' and 'bitcoin' not in n.lower()), None)
-                if not target:
-                    target = next((n for n, t in asset_types.items() if t == 'taxable'), None)
-                if target:
-                    portfolio[target] += surplus
-            fully_funded = True
-            
-        else:
-            # DEFICIT
-            needed = abs(surplus)
-
-            # If we've reached the configured withdrawal age, prefer tapping pre-tax
-            # retirement accounts first (instead of waiting until other sources are exhausted).
-            if needed > 0.1 and age >= params.retirement_withdrawal_age:
-                for n, v in portfolio.items():
-                    if asset_types[n] == 'pre_tax' and v > 0:
-                        gross = needed / 0.75
-                        take = min(gross, v)
-                        portfolio[n] -= take
-                        inc_tracker["retirement_withdrawals"] += take
-                        taxable_income += take
-                        needed -= (take * 0.75)
-                        if needed <= 0.1:
-                            break
-
-            # 1. Brokerage Stocks
-            if needed > 0:
-                for n, v in portfolio.items():
-                    if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower() and v > 0:
-                        gross = needed / TAXABLE_SALE_NET_FACTOR
-                        take = min(gross, v)
-                        portfolio[n] -= take
-                        inc_tracker["brokerage_withdrawals"] += take
-                        needed -= (take * TAXABLE_SALE_NET_FACTOR)
-                        if needed <= 0.1: break # Use small epsilon for float precision
-            
-            # 2. Bitcoin
-            if needed > 0.1:
-                for n, v in portfolio.items():
-                    if 'bitcoin' in n.lower() and v > 0:
-                        gross = needed / TAXABLE_SALE_NET_FACTOR
-                        take = min(gross, v)
-                        portfolio[n] -= take
-                        inc_tracker["bitcoin_withdrawals"] += take
-                        needed -= (take * TAXABLE_SALE_NET_FACTOR)
-                        if needed <= 0.1: break
-
-            # 4. Rental Equity
-            if needed > 0.1:
-                for n, v in portfolio.items():
-                    if asset_types[n] == 'real_estate' and 'primary' not in n.lower() and v > 0:
-                        gross = needed / TAXABLE_SALE_NET_FACTOR
-                        take = min(gross, v)
-                        
-                        pre_sale_value = v + take 
-                        portfolio[n] -= take
-                        if pre_sale_value > 0:
-                            pct_sold = take / pre_sale_value
-                            rental_portfolio_pct *= (1 - pct_sold)
-                        
-                        inc_tracker["brokerage_withdrawals"] += take 
-                        needed -= (take * TAXABLE_SALE_NET_FACTOR)
-                        if needed <= 0.1: break
-
-            # 5. Roth
-            if needed > 0.1:
-                for n, v in portfolio.items():
-                    if asset_types[n] == 'roth' and v > 0:
-                        take = min(needed, v)
-                        portfolio[n] -= take
-                        inc_tracker["roth_withdrawals"] += take
-                        needed -= take
-                        if needed <= 0.1: break
-            
-            # If we reduced 'needed' to effectively 0, we are fully funded
-            if needed <= 1.0: # Allow  tolerance
-                fully_funded = True
-        
-        # 6. RE-CALCULATE TAXES (Final)
-        final_tax = calculate_federal_tax(taxable_income, years_passed=years_passed, inflation=params.general_inflation)
-        effective_tax_rate = final_tax / taxable_income if taxable_income > 0 else 0
-        
-        # 7. CHART DATA
-        after_tax = {
-            "w2_income_after_tax": inc_tracker["w2_income"] * (1 - effective_tax_rate),
-            "rental_income_after_tax": inc_tracker["rental_income"] * (1 - effective_tax_rate),
-            "royalty_income_after_tax": inc_tracker["royalty_income"] * (1 - effective_tax_rate),
-            "dividend_income_after_tax": inc_tracker["dividend_income"] * (1 - effective_tax_rate),
-            "social_security_after_tax": inc_tracker["social_security"] * (1 - effective_tax_rate),
-            "retirement_withdrawals_after_tax": inc_tracker["retirement_withdrawals"] * (1 - effective_tax_rate),
-            "brokerage_withdrawals_after_tax": inc_tracker["brokerage_withdrawals"] * TAXABLE_SALE_NET_FACTOR, 
-            "bitcoin_withdrawals_after_tax": inc_tracker["bitcoin_withdrawals"] * TAXABLE_SALE_NET_FACTOR,
-            "roth_withdrawals_after_tax": inc_tracker["roth_withdrawals"],
-        }
-
-        # Tax breakdown (for stacked expense chart)
-        income_tax_total = float(final_tax)
-        tax_brokerage = float(inc_tracker["brokerage_withdrawals"]) * TAXABLE_SALE_TAX_RATE
-        tax_bitcoin = float(inc_tracker["bitcoin_withdrawals"]) * TAXABLE_SALE_TAX_RATE
-
-        taxable_components = {
-            "tax_w2": float(max(0.0, taxable_w2)),
-            "tax_rental": float(max(0.0, inc_tracker["rental_income"])),
-            "tax_royalty": float(max(0.0, inc_tracker["royalty_income"])),
-            "tax_dividend": float(max(0.0, inc_tracker["dividend_income"])),
-            "tax_social_security": float(max(0.0, inc_tracker["social_security"])),
-            "tax_retirement": float(max(0.0, inc_tracker["retirement_withdrawals"])),
-            "tax_other": float(max(0.0, inc_tracker["other_income"])),
-        }
-
-        if taxable_income > 0 and income_tax_total > 0:
-            for k, amt in taxable_components.items():
-                taxable_components[k] = income_tax_total * (amt / taxable_income)
-        else:
-            for k in taxable_components:
-                taxable_components[k] = 0.0
-
-        tax_total = income_tax_total + tax_brokerage + tax_bitcoin
-        
-        # *** NORMALIZATION FIX ***
-        # Only normalize if we are SOLVENT (fully funded) AND have a meaningful deficit.
-        # Skip normalization for tiny deficits from floating-point noise (< $1).
-        if surplus < -surplus_epsilon and fully_funded:
-            current_total = sum(after_tax.values())
-            if current_total > 0:
-                correction_ratio = target_expenses / current_total
-                for k in after_tax:
-                    after_tax[k] *= correction_ratio
-
-        # 8. ASSETS
-        asset_bk = {
-            "retirement_traditional": sum(v for n, v in portfolio.items() if asset_types[n] == 'pre_tax'),
-            "retirement_roth": sum(v for n, v in portfolio.items() if asset_types[n] == 'roth'),
-            "brokerage": sum(v for n, v in portfolio.items() if asset_types[n] == 'taxable' and 'bitcoin' not in n.lower()),
-            "bitcoin": sum(v for n, v in portfolio.items() if 'bitcoin' in n.lower()),
-            "rental_properties": sum(v for n, v in portfolio.items() if asset_types[n] == 'real_estate' and 'primary' not in n.lower()),
-            "primary_home": sum(v for n, v in portfolio.items() if 'primary' in n.lower()),
-        }
-
-        total_assets = sum(portfolio.values())
-        
-        # Freedom Check
-        passive_gross = (inc_tracker["rental_income"] + inc_tracker["dividend_income"] + 
-                         inc_tracker["royalty_income"] + inc_tracker["social_security"] + 
-                         inc_tracker["retirement_withdrawals"])
-        if passive_gross * (1 - effective_tax_rate) > target_expenses and not freedom_achieved:
-            freedom_achieved = True
-            freedom_year = year
-
-        timeline.append({
-            "year": year,
-            "age": age,
-            "nominal_net_worth": round(total_assets, 0),
-            "real_net_worth": round(total_assets / inflation_mult, 0),
-            "total_expenses": round(target_expenses, 0),
-            "tax_income_total": round(income_tax_total, 0),
-            "tax_brokerage": round(tax_brokerage, 0),
-            "tax_bitcoin": round(tax_bitcoin, 0),
-            "tax_total": round(tax_total, 0),
-            "tax_w2": round(taxable_components["tax_w2"], 0),
-            "tax_rental": round(taxable_components["tax_rental"], 0),
-            "tax_royalty": round(taxable_components["tax_royalty"], 0),
-            "tax_dividend": round(taxable_components["tax_dividend"], 0),
-            "tax_social_security": round(taxable_components["tax_social_security"], 0),
-            "tax_retirement": round(taxable_components["tax_retirement"], 0),
-            "tax_other": round(taxable_components["tax_other"], 0),
-            **after_tax,
-            **asset_bk
-        })
-        
-        for n, v in portfolio.items():
-            gr = next(a.growth_rate for a in params.assets if a.name == n)
-            portfolio[n] = v * (1 + gr)
-            
-        year += 1
-        age += 1
-
-    return {
-        "timeline": timeline,
-        "freedom_year": freedom_year,
-        "metrics": {
-            "nw_at_retirement": next((x for x in timeline if x['age'] == params.target_retirement_age), None),
-            "nw_at_90": next((x for x in timeline if x['age'] == 90), None),
-            "nw_at_95": next((x for x in timeline if x['age'] == 95), None)
-        }
-    }
+__all__ = [
+    "app", "Asset", "Stream", "OtherAsset", "OneTimeExpense", "SimParams",
+    "SpendingRule", "MonteCarloRequest", "MonteCarloRunRequest",
+    "calculate_federal_tax", "get_rmd_divisor", "TAXABLE_SALE_TAX_RATE",
+    "TAXABLE_SALE_NET_FACTOR", "_load_yearly_returns_csv", "_get_historical_stock_return_bins",
+    "_sample_historical_stock_return", "_clamp_return", "_collect_spending_rules", "request_fingerprint",
+]
