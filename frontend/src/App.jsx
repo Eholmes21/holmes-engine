@@ -7,6 +7,8 @@ import { Settings, TrendingUp, Activity, Briefcase, PiggyBank, CreditCard, Plus,
 const CURRENT_YEAR = new Date().getFullYear();
 const PLAN_VERSION = 1;
 const PLAN_STORAGE_KEY = 'holmes-engine-retirement-plan';
+const PLAN_LIBRARY_STORAGE_KEY = 'holmes-engine-scenario-library';
+const PLAN_LIBRARY_VERSION = 1;
 const COOL_EXPENSE_COLORS = ['#10b981', '#3b82f6', '#8b5cf6', '#06b6d4', '#9ca3af'];
 const WARM_TAX_COLORS = ['#ef4444', '#f59e0b', '#f97316', '#ec4899', '#facc15'];
 const DEFAULT_INFLATION_RATE = 3.5;
@@ -114,6 +116,37 @@ const WARNING_TITLES = {
 // Randomization is an explicit user action; it is never used during mount.
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
+const readScenarioLibrary = () => {
+  if (typeof window === 'undefined') return [];
+  try {
+    const library = JSON.parse(window.localStorage.getItem(PLAN_LIBRARY_STORAGE_KEY) || 'null');
+    if (library?.version === PLAN_LIBRARY_VERSION && Array.isArray(library.scenarios)) {
+      return library.scenarios.filter(entry => entry?.id && entry?.name && entry?.plan?.version === PLAN_VERSION);
+    }
+    // Carry the original single-slot save into the new library so an existing
+    // personal plan is not stranded by the scenario-manager upgrade.
+    const legacy = JSON.parse(window.localStorage.getItem(PLAN_STORAGE_KEY) || 'null');
+    if (legacy?.version === PLAN_VERSION) {
+      return [{
+        id: 'scenario_legacy',
+        name: `Saved plan ${legacy.current_year || ''}`.trim(),
+        saved_at: legacy.saved_at || new Date().toISOString(),
+        plan: legacy,
+      }];
+    }
+  } catch {
+    return [];
+  }
+  return [];
+};
+
+const persistScenarioLibrary = (scenarios) => {
+  window.localStorage.setItem(PLAN_LIBRARY_STORAGE_KEY, JSON.stringify({
+    version: PLAN_LIBRARY_VERSION,
+    scenarios,
+  }));
+};
+
 const asNumber = (value, fallback = 0) => {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
@@ -152,6 +185,8 @@ function normalizeTimeline(source, params) {
       property_net_worth: firstFinite(row?.property_net_worth, row?.property_assets, row?.property_assets_cents != null ? wireAmount(row.property_assets_cents, true) : undefined),
       real_net_worth: firstFinite(row?.real_net_worth, row?.real_total_assets, total),
       total_expenses: expenses,
+      income_chart_expenses: firstFinite(row?.income_chart_expenses, expenses),
+      rental_cash_flow_after_tax: firstFinite(row?.rental_cash_flow_after_tax, row?.rental_income_after_tax),
       retirement_traditional: firstFinite(row?.retirement_traditional, row?.traditional_401k, row?.ending_balances_cents?.traditional_401k != null ? wireAmount(row.ending_balances_cents.traditional_401k, true) : undefined),
       retirement_roth: firstFinite(row?.retirement_roth, row?.roth_ira, row?.ending_balances_cents?.roth_ira != null ? wireAmount(row.ending_balances_cents.roth_ira, true) : undefined),
       brokerage: firstFinite(row?.brokerage, row?.taxable, row?.ending_balances_cents?.taxable != null ? wireAmount(row.ending_balances_cents.taxable, true) : undefined),
@@ -228,6 +263,9 @@ function downloadCsv(rows, filename = 'retirement-scenario.csv') {
     property_gross_revenue: row?.property_gross_revenue,
     property_operating_expenses: row?.property_operating_expenses,
     property_net_operating_income: row?.property_net_operating_income,
+    rental_debt_service_total: row?.rental_debt_service_total,
+    rental_cash_flow_before_tax: row?.rental_cash_flow_before_tax,
+    rental_cash_flow_after_tax: row?.rental_cash_flow_after_tax,
     mortgage_principal_total: row?.mortgage_principal_total,
     mortgage_interest_total: row?.mortgage_interest_total,
     real_net_worth: row?.real_net_worth,
@@ -362,7 +400,7 @@ function validateDraft({
       if ('amount' in (item || {})) number(item.amount, `${path}.${index}.amount`, { min: 0 });
       if ('growth_rate' in (item || {}) && item?.growth_mode !== 'global') number(item.growth_rate, `${path}.${index}.growth_rate`, { min: -99.999 });
       if (path === 'assets' && item?.tax_treatment === 'real_estate') {
-        number(item.ownership_pct ?? 100, `${path}.${index}.ownership_pct`, { min: 0.01, max: 100 });
+        number(item.ownership_pct ?? 100, `${path}.${index}.ownership_pct`, { min: 0, max: 100 });
         number(item.annual_revenue ?? 0, `${path}.${index}.annual_revenue`, { min: 0 });
         number(item.annual_operating_expenses ?? 0, `${path}.${index}.annual_operating_expenses`, { min: 0 });
         number(item.mortgage_balance ?? 0, `${path}.${index}.mortgage_balance`, { min: 0 });
@@ -418,6 +456,10 @@ export default function App() {
   // stale result never quietly changes underneath them.
   const [resultSnapshot, setResultSnapshot] = useState(null);
   const [planMessage, setPlanMessage] = useState(null);
+  const [savedScenarios, setSavedScenarios] = useState(readScenarioLibrary);
+  const [scenarioName, setScenarioName] = useState('');
+  const [activeScenarioId, setActiveScenarioId] = useState(null);
+  const [scenarioPanelOpen, setScenarioPanelOpen] = useState(false);
   const [draftErrors, setDraftErrors] = useState([]);
   const [tableOpen, setTableOpen] = useState(false);
   const [mode, setMode] = useState('custom');
@@ -1174,6 +1216,12 @@ export default function App() {
   }), [adaptiveSpendingEnabled, assets, currentAge, currentYear, dividendYieldPct, employerMatchRatePct, historicalWrapMode, inflation, inflows, mcSettings, mode, oneTimeExpenses, otherAssets, outflows, planThroughAge, retireAge, retirementWithdrawalAge, rmdStartAge, saleHaircutPct, seed, spendingRules, stockGrowth, taxFilingStatus, taxVersion, withdrawalOrder, workplaceContributionLimit]);
 
   const savePlan = useCallback(() => {
+    const cleanName = scenarioName.trim();
+    if (!cleanName) {
+      setScenarioPanelOpen(true);
+      setPlanMessage('Name this scenario before saving.');
+      return;
+    }
     const validationErrors = validateDraft({
       currentYear: planSnapshot.current_year,
       currentAge: planSnapshot.current_age,
@@ -1201,19 +1249,35 @@ export default function App() {
       return;
     }
     try {
-      window.localStorage.setItem(PLAN_STORAGE_KEY, JSON.stringify(planSnapshot));
+      const savedAt = new Date().toISOString();
+      const existing = savedScenarios.find(entry => normalizedLabel(entry.name) === normalizedLabel(cleanName));
+      const scenarioId = existing?.id || `scenario_${typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : Date.now()}`;
+      const entry = {
+        id: scenarioId,
+        name: cleanName,
+        saved_at: savedAt,
+        plan: { ...planSnapshot, saved_at: savedAt },
+      };
+      const nextScenarios = existing
+        ? savedScenarios.map(item => item.id === existing.id ? entry : item)
+        : [entry, ...savedScenarios];
+      persistScenarioLibrary(nextScenarios);
+      setSavedScenarios(nextScenarios);
+      setActiveScenarioId(scenarioId);
+      setScenarioName(cleanName);
       setDraftErrors([]);
-      setPlanMessage(`Plan saved for ${planSnapshot.current_year}.`);
+      setPlanMessage(existing ? `“${cleanName}” updated.` : `“${cleanName}” saved.`);
     } catch {
-      setPlanMessage('Plan could not be saved in this browser.');
+      setPlanMessage('Scenario could not be saved in this browser.');
     }
-  }, [planSnapshot]);
+  }, [planSnapshot, savedScenarios, scenarioName]);
 
-  const loadPlan = useCallback(() => {
+  const loadPlan = useCallback((scenarioId) => {
     try {
-      const parsed = JSON.parse(window.localStorage.getItem(PLAN_STORAGE_KEY) || 'null');
+      const entry = savedScenarios.find(item => item.id === scenarioId);
+      const parsed = entry?.plan;
       if (!parsed || parsed.version !== PLAN_VERSION) {
-        setPlanMessage('No compatible saved plan was found.');
+        setPlanMessage('That saved scenario is unavailable or incompatible.');
         return;
       }
       const validationErrors = validateDraft({
@@ -1288,11 +1352,32 @@ export default function App() {
       // stale so it cannot be mistaken for the newly loaded inputs.
       setResultSignature(data ? '__stale_after_load__' : null);
       if (data) setRunState(previous => ({ ...previous, status: 'stale' }));
-      setPlanMessage(`Plan loaded from ${parsed.saved_at ? new Date(parsed.saved_at).toLocaleString() : 'saved storage'}.`);
+      setActiveScenarioId(entry.id);
+      setScenarioName(entry.name);
+      setScenarioPanelOpen(false);
+      setPlanMessage(`“${entry.name}” loaded from ${parsed.saved_at ? new Date(parsed.saved_at).toLocaleString() : 'saved storage'}.`);
     } catch {
-      setPlanMessage('The saved plan is unreadable or was created by an older version.');
+      setPlanMessage('The saved scenario is unreadable or was created by an older version.');
     }
-  }, [data, invalidatePendingRequests]);
+  }, [data, invalidatePendingRequests, savedScenarios]);
+
+  const deleteScenario = useCallback((scenarioId) => {
+    const target = savedScenarios.find(entry => entry.id === scenarioId);
+    if (!target) return;
+    if (!window.confirm(`Delete “${target.name}”? This cannot be undone.`)) return;
+    try {
+      const nextScenarios = savedScenarios.filter(entry => entry.id !== scenarioId);
+      persistScenarioLibrary(nextScenarios);
+      setSavedScenarios(nextScenarios);
+      if (activeScenarioId === scenarioId) {
+        setActiveScenarioId(null);
+        setScenarioName('');
+      }
+      setPlanMessage(`“${target.name}” deleted.`);
+    } catch {
+      setPlanMessage('Scenario could not be deleted from this browser.');
+    }
+  }, [activeScenarioId, savedScenarios]);
 
   const exportCurrentCsv = useCallback(() => {
     const exportMode = resultSnapshot?.mode || mode;
@@ -1370,7 +1455,7 @@ const RUN_FILTER_OPTIONS = [
           )}
           {variant === 'expenses' && (
             <p className="text-sm text-slate-200">
-              {`Total Nominal Expenses: ${formatValueDetailed(d?.total_expenses)}`}
+              {`Other Expenses: ${formatValueDetailed(d?.income_chart_expenses)}`}
             </p>
           )}
 
@@ -1824,6 +1909,8 @@ const RUN_FILTER_OPTIONS = [
   const totalAssets = totalFinancialAssets + totalHousingEquity;
   const totalIncome = inflows.filter(i => i.start_year <= currentYear && i.end_year >= currentYear).reduce((sum, i) => sum + i.amount, 0);
   const totalExpenses = outflows.filter(o => o.start_year <= currentYear && o.end_year >= currentYear).reduce((sum, o) => sum + o.amount, 0);
+  const matchingScenario = savedScenarios.find(entry => normalizedLabel(entry.name) === normalizedLabel(scenarioName));
+  const activeScenario = savedScenarios.find(entry => entry.id === activeScenarioId);
   const warningsForDisplay = useMemo(() => {
     const warnings = [...resultWarnings];
     const addDraftWarning = (warning) => {
@@ -1912,8 +1999,55 @@ const RUN_FILTER_OPTIONS = [
                 <BarChart3 size={16}/>
                 {runState.status === 'running' ? 'Running…' : `Run ${mode === 'historical' ? 'Historical Monte Carlo' : 'Custom Scenario'}`}
               </button>
-              <button type="button" onClick={savePlan} className="toolbar-button" data-testid="save-plan">Save plan</button>
-              <button type="button" onClick={loadPlan} className="toolbar-button" data-testid="load-plan">Load plan</button>
+              <div className="scenario-manager">
+                <button
+                  type="button"
+                  onClick={() => setScenarioPanelOpen(previous => !previous)}
+                  className="toolbar-button"
+                  aria-expanded={scenarioPanelOpen}
+                  aria-controls="scenario-library-panel"
+                  data-testid="scenario-library-toggle"
+                >Scenarios ({savedScenarios.length})</button>
+                {scenarioPanelOpen ? (
+                  <div id="scenario-library-panel" className="scenario-panel" role="dialog" aria-label="Saved scenarios">
+                    <div className="scenario-panel-header">
+                      <div>
+                        <strong>Saved scenarios</strong>
+                        <span>Stored only in this browser.</span>
+                      </div>
+                      <button type="button" onClick={() => setScenarioPanelOpen(false)} aria-label="Close scenarios">×</button>
+                    </div>
+                    <label className={labelClass} htmlFor="scenario-name">Scenario name</label>
+                    <div className="scenario-save-row">
+                      <input
+                        id="scenario-name"
+                        value={scenarioName}
+                        onChange={event => setScenarioName(event.target.value)}
+                        placeholder="e.g. Base case"
+                        maxLength={80}
+                        className={inputClass}
+                      />
+                      <button type="button" onClick={savePlan} className="scenario-primary-action" data-testid="save-scenario">
+                        {matchingScenario ? 'Update' : 'Save new'}
+                      </button>
+                    </div>
+                    {activeScenario ? <p className="scenario-active-copy">Loaded: <strong>{activeScenario.name}</strong>. Change the name to save a copy.</p> : null}
+                    <div className="scenario-list" aria-label="Scenario list">
+                      {savedScenarios.length === 0 ? (
+                        <div className="scenario-empty">No saved scenarios yet.</div>
+                      ) : savedScenarios.map(entry => (
+                        <div key={entry.id} className={entry.id === activeScenarioId ? 'scenario-row active' : 'scenario-row'}>
+                          <button type="button" className="scenario-load" onClick={() => loadPlan(entry.id)}>
+                            <strong>{entry.name}</strong>
+                            <span>{entry.saved_at ? new Date(entry.saved_at).toLocaleString() : 'Saved locally'}</span>
+                          </button>
+                          <button type="button" className="scenario-delete" onClick={() => deleteScenario(entry.id)} aria-label={`Delete ${entry.name}`}><Trash2 size={15}/></button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
               <button type="button" onClick={exportCurrentCsv} disabled={!data} className="toolbar-button" data-testid="export-csv">Export CSV</button>
               <details className="stress-menu">
                 <summary className="toolbar-button">Stress test</summary>
@@ -2629,6 +2763,10 @@ const RUN_FILTER_OPTIONS = [
                   const ownedOperatingExpenses = asNumber(asset.annual_operating_expenses, 0) * ownershipShare;
                   const currentNoi = ownedRevenue - ownedOperatingExpenses;
                   const estimatedPayment = estimatedMortgagePayment(asset);
+                  const annualDebtService = asNumber(asset.mortgage_balance, 0) > 0
+                    ? estimatedPayment * Math.min(12, Math.max(0, Math.trunc(asNumber(asset.mortgage_payments_remaining, 0))))
+                    : 0;
+                  const cashAfterDebt = currentNoi - annualDebtService;
                   return (
                     <article key={asset.id || i} className="housing-property-card">
                       <div className="housing-property-header">
@@ -2659,7 +2797,7 @@ const RUN_FILTER_OPTIONS = [
                         </div>
                         <div>
                           <label className={labelClass} htmlFor={`property-ownership-${i}`}>Your ownership %</label>
-                          <input id={`property-ownership-${i}`} type="number" min="0.01" max="100" step="0.01" value={asset.ownership_pct ?? 100} onChange={e => updateAsset(i, 'ownership_pct', Number(e.target.value))} className={inputClass}/>
+                          <input id={`property-ownership-${i}`} type="number" min="0" max="100" step="0.01" value={asset.ownership_pct ?? 100} onChange={e => updateAsset(i, 'ownership_pct', Number(e.target.value))} className={inputClass}/>
                         </div>
                       </div>
                       <div className="property-cashflow-panel">
@@ -2711,10 +2849,11 @@ const RUN_FILTER_OPTIONS = [
                         </div>
                       </div>
                       <div className="housing-summary-grid">
-                        <div><span>Your gross share</span><strong>{fmt(ownedValue)}</strong></div>
                         <div><span>Your annual revenue</span><strong>{fmt(ownedRevenue)}</strong></div>
                         <div><span>Your annual OpEx</span><strong>{fmt(ownedOperatingExpenses)}</strong></div>
                         <div><span>Current NOI</span><strong className={currentNoi < 0 ? 'text-red-300' : 'text-emerald-300'}>{fmt(currentNoi)}</strong></div>
+                        <div><span>Annual debt service</span><strong>{fmt(annualDebtService)}</strong></div>
+                        <div><span>Cash after debt</span><strong className={cashAfterDebt < 0 ? 'text-red-300' : 'text-emerald-300'}>{fmt(cashAfterDebt)}</strong></div>
                         <div><span>Current equity</span><strong className={equity < 0 ? 'text-red-300' : 'text-emerald-300'}>{fmt(equity)}</strong></div>
                       </div>
                     </article>
@@ -3032,7 +3171,10 @@ const RUN_FILTER_OPTIONS = [
             </div>
 
             <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 h-[360px]">
-              <h3 className="text-lg font-semibold mb-2">After-Tax Income vs Expenses</h3>
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-lg font-semibold">After-Tax Cash Flow vs Expenses</h3>
+                {resultIsStale ? <span className="rounded-full border border-amber-700 bg-amber-950/60 px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-amber-300">Inputs changed · run again</span> : null}
+              </div>
               {data?.length ? (
                 <div style={{width: '100%', height: '300px'}}>
                   <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
@@ -3042,7 +3184,7 @@ const RUN_FILTER_OPTIONS = [
                       <Tooltip content={<CustomTooltip variant="expenses" />} />
                       <Legend wrapperStyle={{fontSize: 10}}/>
                       <Bar dataKey="w2_income_after_tax" stackId="income" fill="#9ca3af" name="W2 Salary"/>
-                      <Bar dataKey="rental_income_after_tax" stackId="income" fill="#f59e0b" name="Rental Income"/>
+                      <Bar dataKey="rental_cash_flow_after_tax" stackId="income" fill="#f59e0b" name="Rental Cash Flow"/>
                       <Bar dataKey="retirement_withdrawals_after_tax" stackId="income" fill="#10b981" name="401k Withdrawals"/>
                       <Bar dataKey="brokerage_withdrawals_after_tax" stackId="income" fill="#8b5cf6" name="Brokerage Withdrawals"/>
                       <Bar dataKey="bitcoin_withdrawals_after_tax" stackId="income" fill="#f97316" name="Bitcoin Withdrawals"/>
@@ -3050,7 +3192,7 @@ const RUN_FILTER_OPTIONS = [
                       <Bar dataKey="royalty_income_after_tax" stackId="income" fill="#ec4899" name="Royalties"/>
                       <Bar dataKey="dividend_income_after_tax" stackId="income" fill="#facc15" name="Dividends"/>
                       <Bar dataKey="social_security_after_tax" stackId="income" fill="#06b6d4" name="Social Security"/>
-                      <Line type="monotone" dataKey="total_expenses" stroke="#ef4444" strokeWidth={3} dot={false} name="Expenses"/>
+                      <Line type="monotone" dataKey="income_chart_expenses" stroke="#ef4444" strokeWidth={3} dot={false} name="Other Expenses"/>
                     </ComposedChart>
                   </ResponsiveContainer>
                 </div>

@@ -676,8 +676,8 @@ class AccountingCore:
             value = _positive_or_zero(asset.value, field_name=f"assets.{asset.name}.value")
             if self.kinds[asset.name] == "real_estate":
                 ownership = _finite(getattr(asset, "ownership_percentage", 1.0), field_name=f"assets.{asset.name}.ownership_percentage")
-                if not 0.0 < ownership <= 1.0:
-                    raise ValueError(f"assets.{asset.name}.ownership_percentage must be greater than 0 and no more than 1")
+                if not 0.0 <= ownership <= 1.0:
+                    raise ValueError(f"assets.{asset.name}.ownership_percentage must be between 0 and 1")
                 self.portfolio[asset.name] = value * ownership
                 self.mortgage_balances[asset.name] = _positive_or_zero(
                     getattr(asset, "mortgage_balance", 0.0),
@@ -1519,6 +1519,18 @@ class AccountingCore:
             one_time_total, one_time_expense_details = self._one_time_expenses(year, age)
             mortgage_payment_total, mortgage_details = self._apply_mortgage_payments()
             property_rental_income, property_operating_shortfall, property_cash_totals, property_cash_details = self._property_cash_flow(inflation_multiplier)
+            mortgage_by_asset_id = {str(item["asset_id"]): float(item["payment_total"]) for item in mortgage_details}
+            rental_debt_service_total = 0.0
+            rental_operating_shortfall = 0.0
+            rental_property_noi = 0.0
+            for detail in property_cash_details:
+                debt_service = mortgage_by_asset_id.get(str(detail["asset_id"]), 0.0)
+                detail["debt_service"] = debt_service
+                detail["cash_flow_after_debt_service"] = float(detail["net_operating_income"]) - debt_service
+                if detail["property_role"] != "primary":
+                    rental_debt_service_total += debt_service
+                    rental_property_noi += float(detail["net_operating_income"])
+                    rental_operating_shortfall += max(0.0, -float(detail["net_operating_income"]))
 
             # A spending rule reacts to the prior interval's market return and
             # affects the current year only.  Values are validated, never clamped.
@@ -1565,7 +1577,9 @@ class AccountingCore:
 
             rental_pct = 1.0 if self.rental_income_active else 0.0
             tracker, income_by_id, income_details = self._income(year, age, inflation_for_year, inflation_multiplier, years_passed, rental_pct)
+            legacy_rental_income = tracker["rental_income"]
             tracker["rental_income"] += property_rental_income
+            rental_cash_flow_before_tax = legacy_rental_income + rental_property_noi - rental_debt_service_total
             for detail in property_cash_details:
                 amount = max(0.0, float(detail["net_operating_income"]))
                 if amount <= 0.0:
@@ -1784,6 +1798,15 @@ class AccountingCore:
                 key: (final_income_tax * value / taxable_component_total if taxable_component_total else 0.0)
                 for key, value in taxable_component_values.items()
             }
+            rental_cash_flow_after_tax = rental_cash_flow_before_tax - tax_component_amounts["tax_rental"]
+            # The main cash-flow chart nets rental OpEx and rental debt service
+            # into the rental bar. Remove those same cash needs from its expense
+            # line so the comparison never presents them twice. The canonical
+            # total_expenses field remains unchanged for the accounting ledger.
+            income_chart_expenses = max(
+                0.0,
+                target_expenses - rental_debt_service_total - rental_operating_shortfall,
+            )
             mortgage_balance_total = sum(self.mortgage_balances.values())
             total_assets = _sum_values(self.portfolio, self.names) + self.cash_reserve - mortgage_balance_total
             liquid_assets = (_sum_values(self.portfolio, liquid_names) if liquid_names else 0.0) + self.cash_reserve
@@ -1817,6 +1840,10 @@ class AccountingCore:
                 "cash_income_after_tax": round(cash_income_after_tax, 0),
                 "w2_income_after_tax": round(max(0.0, tracker["w2_income"] - employee_contribution - tax_component_amounts["tax_w2"]), 0),
                 "rental_income_after_tax": round(max(0.0, tracker["rental_income"] - tax_component_amounts["tax_rental"]), 0),
+                "rental_cash_flow_before_tax": round(rental_cash_flow_before_tax, 0),
+                "rental_cash_flow_after_tax": round(rental_cash_flow_after_tax, 0),
+                "rental_debt_service_total": round(rental_debt_service_total, 0),
+                "income_chart_expenses": round(income_chart_expenses, 0),
                 "royalty_income_after_tax": round(max(0.0, tracker["royalty_income"] - tax_component_amounts["tax_royalty"]), 0),
                 "dividend_income_after_tax": round(max(0.0, tracker["dividend_income"] - tax_component_amounts["tax_dividend"]), 0),
                 "social_security_after_tax": round(max(0.0, tracker["social_security"] - tax_component_amounts["tax_social_security"]), 0),

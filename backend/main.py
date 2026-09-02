@@ -207,8 +207,8 @@ class Asset(WireModel):
     @classmethod
     def valid_ownership_percentage(cls, value: float) -> float:
         value = _finite(value, "ownership_percentage")
-        if not 0.0 < value <= 1.0:
-            raise ValueError("ownership_percentage must be greater than 0 and no more than 1")
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("ownership_percentage must be between 0 and 1")
         return value
 
     @field_validator("mortgage_interest_rate")

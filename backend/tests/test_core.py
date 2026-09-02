@@ -390,6 +390,29 @@ class CoreRulesTests(unittest.TestCase):
         self.assertEqual(row["property_net_worth"], 324_000)
         self.assertEqual(row["total_expenses"], 24_000)
 
+    def test_zero_percent_property_is_kept_for_reference_but_not_counted(self):
+        request = params(
+            current_age=60,
+            target_retirement_age=60,
+            retirement_withdrawal_age=60,
+            assets=[
+                {"name": "Brokerage", "value": 1_000_000, "growth_rate": 0.0, "tax_treatment": "taxable"},
+                {
+                    "name": "Household Home",
+                    "value": 750_000,
+                    "growth_rate": 0.0,
+                    "tax_treatment": "real_estate",
+                    "property_role": "primary",
+                    "ownership_percentage": 0.0,
+                    "annual_operating_expenses": 20_000,
+                },
+            ],
+        )
+        row = simulate_one(request, mode="custom")["timeline"][0]
+        self.assertEqual(row["property_net_worth"], 0)
+        self.assertEqual(row["property_operating_expenses"], 0)
+        self.assertEqual(row["total_expenses"], 0)
+
     def test_property_value_revenue_and_opex_follow_inflation_and_ownership(self):
         request = params(
             current_age=60,
@@ -443,6 +466,37 @@ class CoreRulesTests(unittest.TestCase):
         self.assertEqual(rows[0]["total_expenses"], 10_000)
         self.assertEqual(rows[1]["property_operating_shortfall"], 10_500)
         self.assertEqual(rows[1]["total_expenses"], 10_500)
+
+    def test_rental_cash_flow_nets_opex_and_debt_service_without_double_counting(self):
+        request = params(
+            current_age=60,
+            target_retirement_age=60,
+            retirement_withdrawal_age=60,
+            assets=[
+                {"name": "Brokerage", "value": 1_000_000, "growth_rate": 0.0, "tax_treatment": "taxable"},
+                {
+                    "name": "Rental A",
+                    "value": 300_000,
+                    "growth_rate": 0.0,
+                    "tax_treatment": "real_estate",
+                    "property_role": "rental",
+                    "annual_revenue": 30_000,
+                    "annual_operating_expenses": 10_000,
+                    "mortgage_balance": 100_000,
+                    "mortgage_interest_rate": 0.0,
+                    "mortgage_monthly_payment": 1_000,
+                    "mortgage_payments_remaining": 100,
+                },
+            ],
+        )
+        row = simulate_one(request, mode="custom")["timeline"][0]
+        self.assertEqual(row["property_net_operating_income"], 20_000)
+        self.assertEqual(row["rental_debt_service_total"], 12_000)
+        self.assertEqual(row["rental_cash_flow_before_tax"], 8_000)
+        self.assertEqual(row["rental_cash_flow_after_tax"], 8_000)
+        self.assertEqual(row["total_expenses"], 12_000)
+        self.assertEqual(row["income_chart_expenses"], 0)
+        self.assertEqual(row["property_cash_flow_details"][0]["cash_flow_after_debt_service"], 8_000)
 
     def test_property_sale_pays_mortgage_from_owned_share_before_releasing_cash(self):
         request = params(

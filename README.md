@@ -50,7 +50,9 @@ and the destination is returned with each row.
 
 Runs are immutable snapshots: changing inputs never silently re-runs a result.
 The UI marks an old result stale, requires an explicit Run, and can save/load
-one local plan in the browser or export the visible year-by-year ledger as CSV.
+multiple named scenarios in the browser or export the visible year-by-year
+ledger as CSV. Saved scenarios stay on that browser and device; no account or
+cloud sync is required.
 
 ## Run locally
 
