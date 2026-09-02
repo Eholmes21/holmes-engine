@@ -538,8 +538,10 @@ class ApiContractTests(unittest.TestCase):
         self.assertTrue(body["adaptiveSpendingEnabled"])
         self.assertIn("baselineSuccessRate", body)
         self.assertIn("adaptiveSuccessRate", body)
+        self.assertIn("p1", body["percentileData"][0])
         self.assertIn("liquid_net_worth", body["percentileData"][0])
         self.assertIn("property_net_worth", body["percentileData"][0])
+        self.assertIn("p99", body["percentileData"][0])
 
     def test_inspector_requires_matching_fingerprint(self):
         client = TestClient(app)

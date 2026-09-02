@@ -2104,11 +2104,13 @@ def monte_carlo(
         percentile_data.append({
             "age": age,
             "year": years[index],
+            "p1": _percentile(vals, 0.01),
             "p10": _percentile(vals, 0.10),
             "p25": _percentile(vals, 0.25),
             "p50": _percentile(vals, 0.50),
             "p75": _percentile(vals, 0.75),
             "p90": _percentile(vals, 0.90),
+            "p99": _percentile(vals, 0.99),
             "mean": sum(vals) / len(vals) if vals else 0.0,
             # The aggregate timeline is a median snapshot. Keep liquid and
             # property wealth available to the table without pretending the

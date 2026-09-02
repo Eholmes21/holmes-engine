@@ -170,25 +170,31 @@ const firstFinite = (...values) => {
 // Recharts stacks area series from zero. Keep the lower percentile as a
 // transparent base and stack only the differences between adjacent
 // percentiles so the shaded region represents the actual simulation range
-// rather than five overlapping fills that all start at zero.
+// rather than multiple overlapping fills that all start at zero.
 const withPercentileBands = (rows) => (Array.isArray(rows) ? rows.map((row) => {
-  const p10 = firstFinite(row?.p10, row?.p10_value);
+  const p1 = firstFinite(row?.p1, row?.p1_value, row?.p10, row?.p10_value);
+  const p10 = firstFinite(row?.p10, row?.p10_value, p1);
   const p25 = firstFinite(row?.p25, row?.p25_value, p10);
   const p50 = firstFinite(row?.p50, row?.median, p25);
   const p75 = firstFinite(row?.p75, row?.p75_value, p50);
   const p90 = firstFinite(row?.p90, row?.p90_value, p75);
+  const p99 = firstFinite(row?.p99, row?.p99_value, row?.p90, row?.p90_value, p90);
   return {
     ...row,
+    p1,
     p10,
     p25,
     p50,
     p75,
     p90,
-    p10Base: p10,
+    p99,
+    p1Base: p1,
+    p10Band: Math.max(0, p10 - p1),
     p25Band: Math.max(0, p25 - p10),
     p50Band: Math.max(0, p50 - p25),
     p75Band: Math.max(0, p75 - p50),
     p90Band: Math.max(0, p90 - p75),
+    p99Band: Math.max(0, p99 - p90),
   };
 }) : []);
 
@@ -511,14 +517,6 @@ export default function App() {
   const mcNetWorthChartData = useMemo(
     () => withPercentileBands(mcResults?.percentileData),
     [mcResults],
-  );
-  const mcExpenseChartData = useMemo(
-    () => withPercentileBands(mcResults?.expensePercentileData),
-    [mcResults],
-  );
-  const mcExpenseHasSpread = useMemo(
-    () => mcExpenseChartData.some(row => Math.abs(asNumber(row.p90) - asNumber(row.p10)) >= 1),
-    [mcExpenseChartData],
   );
 
   const [spendingRules, setSpendingRules] = useState([
@@ -1580,11 +1578,13 @@ const RUN_FILTER_OPTIONS = [
       const year = Number.isFinite(Number(d?.year)) ? Number(d.year) : null;
       const title = year == null ? `Age ${age}` : `Year ${year} (Age ${age})`;
       const rows = [
+        ['99th percentile', d?.p99, 'text-red-300'],
         ['90th percentile', d?.p90, 'text-red-400'],
         ['75th percentile', d?.p75, 'text-orange-400'],
         ['Median (50th)', d?.p50, 'text-emerald-400'],
         ['25th percentile', d?.p25, 'text-cyan-400'],
         ['10th percentile', d?.p10, 'text-purple-400'],
+        ['1st percentile', d?.p1, 'text-violet-400'],
         ['Mean', d?.mean, 'text-slate-200'],
       ];
       return (
@@ -2315,63 +2315,33 @@ const RUN_FILTER_OPTIONS = [
                 </div>
               )}
 
-              {(mcNetWorthChartData.length > 0 || mcExpenseChartData.length > 0) && (
-                <div className="mt-6 grid grid-cols-1 xl:grid-cols-2 gap-4">
-                  {mcNetWorthChartData.length > 0 && (
-                    <div className="bg-slate-900 p-4 rounded-xl border border-slate-700 h-[400px]" data-testid="mc-net-worth-chart">
-                      <h3 className="text-lg font-semibold mb-1">Monte Carlo: Net Worth by Year</h3>
-                      <p className="text-xs text-slate-500 mb-2">Nominal net worth across the simulation set. Shading shows the 10th–90th percentile range.</p>
-                      <ResponsiveContainer width="100%" height="84%" initialDimension={CHART_INITIAL_DIMENSION}>
-                        <ComposedChart data={mcNetWorthChartData} margin={{ top: 4, right: 12, left: 4, bottom: 4 }}>
-                          <XAxis dataKey="age" stroke="#64748b" tick={{fontSize: 11}} />
-                          <YAxis stroke="#64748b" tickFormatter={formatValue} tick={{fontSize: 11}} />
-                          <Tooltip content={<MonteCarloPercentileTooltip metricLabel="Nominal net worth" />} />
-                          <Legend wrapperStyle={{fontSize: 10}} />
-                          <Area type="monotone" dataKey="p10Base" stackId="net-worth-range" stroke="none" fill="transparent" fillOpacity={0} legendType="none" />
-                          <Area type="monotone" dataKey="p25Band" stackId="net-worth-range" stroke="none" fill="#8b5cf6" fillOpacity={0.13} name="10th–25th range" />
-                          <Area type="monotone" dataKey="p50Band" stackId="net-worth-range" stroke="none" fill="#06b6d4" fillOpacity={0.13} name="25th–50th range" />
-                          <Area type="monotone" dataKey="p75Band" stackId="net-worth-range" stroke="none" fill="#10b981" fillOpacity={0.13} name="50th–75th range" />
-                          <Area type="monotone" dataKey="p90Band" stackId="net-worth-range" stroke="none" fill="#f59e0b" fillOpacity={0.13} name="75th–90th range" />
-                          <Line type="monotone" dataKey="p10" stroke="#a78bfa" strokeWidth={1.5} dot={false} name="10th percentile" />
-                          <Line type="monotone" dataKey="p25" stroke="#22d3ee" strokeWidth={1.5} dot={false} name="25th percentile" />
-                          <Line type="monotone" dataKey="p50" stroke="#34d399" strokeWidth={2} dot={false} name="Median" />
-                          <Line type="monotone" dataKey="p75" stroke="#fbbf24" strokeWidth={1.5} dot={false} name="75th percentile" />
-                          <Line type="monotone" dataKey="p90" stroke="#f87171" strokeWidth={1.5} dot={false} name="90th percentile" />
-                          <Line type="monotone" dataKey="mean" stroke="#f8fafc" strokeWidth={2} strokeDasharray="5 5" dot={false} name="Mean" />
-                        </ComposedChart>
-                      </ResponsiveContainer>
-                    </div>
-                  )}
-
-                  {mcExpenseChartData.length > 0 && (
-                    <div className="bg-slate-900 p-4 rounded-xl border border-slate-700 h-[400px]" data-testid="mc-expense-chart">
-                      <h3 className="text-lg font-semibold mb-1">Monte Carlo: Planned Spending by Year</h3>
-                      <p className="text-xs text-slate-500 mb-2">
-                        {mcExpenseHasSpread
-                          ? 'Annual spending need before income taxes, including mortgage payments and property operating shortfalls. Shading shows the simulation range.'
-                          : 'This plan has the same pre-tax spending need in every run; market returns change net worth, not planned spending. Enable adaptive spending or inflation volatility to model a range.'}
-                      </p>
-                      <ResponsiveContainer width="100%" height="84%" initialDimension={CHART_INITIAL_DIMENSION}>
-                        <ComposedChart data={mcExpenseChartData} margin={{ top: 4, right: 12, left: 4, bottom: 4 }}>
-                          <XAxis dataKey="age" stroke="#64748b" tick={{fontSize: 11}} />
-                          <YAxis stroke="#64748b" tickFormatter={formatValue} tick={{fontSize: 11}} />
-                          <Tooltip content={<MonteCarloPercentileTooltip metricLabel="Planned nominal spending" />} />
-                          <Legend wrapperStyle={{fontSize: 10}} />
-                          <Area type="monotone" dataKey="p10Base" stackId="expense-range" stroke="none" fill="transparent" fillOpacity={0} legendType="none" />
-                          <Area type="monotone" dataKey="p25Band" stackId="expense-range" stroke="none" fill="#8b5cf6" fillOpacity={0.13} name="10th–25th range" />
-                          <Area type="monotone" dataKey="p50Band" stackId="expense-range" stroke="none" fill="#06b6d4" fillOpacity={0.13} name="25th–50th range" />
-                          <Area type="monotone" dataKey="p75Band" stackId="expense-range" stroke="none" fill="#10b981" fillOpacity={0.13} name="50th–75th range" />
-                          <Area type="monotone" dataKey="p90Band" stackId="expense-range" stroke="none" fill="#f59e0b" fillOpacity={0.13} name="75th–90th range" />
-                          <Line type="monotone" dataKey="p10" stroke="#a78bfa" strokeWidth={1.5} dot={false} name="10th percentile" />
-                          <Line type="monotone" dataKey="p25" stroke="#22d3ee" strokeWidth={1.5} dot={false} name="25th percentile" />
-                          <Line type="monotone" dataKey="p50" stroke="#34d399" strokeWidth={2} dot={false} name="Median" />
-                          <Line type="monotone" dataKey="p75" stroke="#fbbf24" strokeWidth={1.5} dot={false} name="75th percentile" />
-                          <Line type="monotone" dataKey="p90" stroke="#f87171" strokeWidth={1.5} dot={false} name="90th percentile" />
-                          <Line type="monotone" dataKey="mean" stroke="#f8fafc" strokeWidth={2} strokeDasharray="5 5" dot={false} name="Mean" />
-                        </ComposedChart>
-                      </ResponsiveContainer>
-                    </div>
-                  )}
+              {mcNetWorthChartData.length > 0 && (
+                <div className="mt-6 bg-slate-900 p-4 rounded-xl border border-slate-700 h-[440px]" data-testid="mc-net-worth-chart">
+                  <h3 className="text-lg font-semibold mb-1">Monte Carlo: Net Worth by Year</h3>
+                  <p className="text-xs text-slate-500 mb-2">Nominal net worth across the simulation set. Shading shows the 1st–99th percentile range.</p>
+                  <ResponsiveContainer width="100%" height="86%" initialDimension={CHART_INITIAL_DIMENSION}>
+                    <ComposedChart data={mcNetWorthChartData} margin={{ top: 4, right: 12, left: 4, bottom: 4 }}>
+                      <XAxis dataKey="age" stroke="#64748b" tick={{fontSize: 11}} />
+                      <YAxis stroke="#64748b" tickFormatter={formatValue} tick={{fontSize: 11}} />
+                      <Tooltip content={<MonteCarloPercentileTooltip metricLabel="Nominal net worth" />} />
+                      <Legend wrapperStyle={{fontSize: 10}} />
+                      <Area type="monotone" dataKey="p1Base" stackId="net-worth-range" stroke="none" fill="transparent" fillOpacity={0} legendType="none" />
+                      <Area type="monotone" dataKey="p10Band" stackId="net-worth-range" stroke="none" fill="#8b5cf6" fillOpacity={0.10} legendType="none" />
+                      <Area type="monotone" dataKey="p25Band" stackId="net-worth-range" stroke="none" fill="#06b6d4" fillOpacity={0.10} legendType="none" />
+                      <Area type="monotone" dataKey="p50Band" stackId="net-worth-range" stroke="none" fill="#10b981" fillOpacity={0.10} legendType="none" />
+                      <Area type="monotone" dataKey="p75Band" stackId="net-worth-range" stroke="none" fill="#f59e0b" fillOpacity={0.10} legendType="none" />
+                      <Area type="monotone" dataKey="p90Band" stackId="net-worth-range" stroke="none" fill="#ef4444" fillOpacity={0.10} legendType="none" />
+                      <Area type="monotone" dataKey="p99Band" stackId="net-worth-range" stroke="none" fill="#dc2626" fillOpacity={0.10} legendType="none" />
+                      <Line type="monotone" dataKey="p1" stroke="#c4b5fd" strokeWidth={1.5} dot={false} name="1st percentile" />
+                      <Line type="monotone" dataKey="p10" stroke="#a78bfa" strokeWidth={1.5} dot={false} name="10th percentile" />
+                      <Line type="monotone" dataKey="p25" stroke="#22d3ee" strokeWidth={1.5} dot={false} name="25th percentile" />
+                      <Line type="monotone" dataKey="p50" stroke="#34d399" strokeWidth={2} dot={false} name="Median" />
+                      <Line type="monotone" dataKey="p75" stroke="#fbbf24" strokeWidth={1.5} dot={false} name="75th percentile" />
+                      <Line type="monotone" dataKey="p90" stroke="#f87171" strokeWidth={1.5} dot={false} name="90th percentile" />
+                      <Line type="monotone" dataKey="p99" stroke="#fb7185" strokeWidth={1.5} dot={false} name="99th percentile" />
+                      <Line type="monotone" dataKey="mean" stroke="#f8fafc" strokeWidth={2} strokeDasharray="5 5" dot={false} name="Mean" />
+                    </ComposedChart>
+                  </ResponsiveContainer>
                 </div>
               )}
               
@@ -3333,7 +3303,7 @@ const RUN_FILTER_OPTIONS = [
             {/* Monte Carlo Percentile Chart */}
             {mcNetWorthChartData.length > 0 && (
               <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 h-[360px]">
-                <h3 className="text-lg font-semibold mb-2">Monte Carlo: Net Worth Percentiles</h3>
+                <h3 className="text-lg font-semibold mb-2">Monte Carlo: Net Worth Percentiles (1st–99th)</h3>
                 <div style={{width: '100%', height: '300px'}}>
                   <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
                     <ComposedChart data={mcNetWorthChartData}>
@@ -3341,16 +3311,20 @@ const RUN_FILTER_OPTIONS = [
                       <YAxis stroke="#64748b" tickFormatter={formatValue} tick={{fontSize: 11}}/>
                       <Tooltip content={<MonteCarloPercentileTooltip metricLabel="Nominal net worth" />} />
                       <Legend wrapperStyle={{fontSize: 10}}/>
-                      <Area type="monotone" dataKey="p10Base" stackId="net-worth-range" stroke="none" fill="transparent" fillOpacity={0} legendType="none" />
-                      <Area type="monotone" dataKey="p25Band" stackId="net-worth-range" stroke="none" fill="#8b5cf6" fillOpacity={0.13} name="10th–25th range" />
-                      <Area type="monotone" dataKey="p50Band" stackId="net-worth-range" stroke="none" fill="#06b6d4" fillOpacity={0.13} name="25th–50th range" />
-                      <Area type="monotone" dataKey="p75Band" stackId="net-worth-range" stroke="none" fill="#10b981" fillOpacity={0.13} name="50th–75th range" />
-                      <Area type="monotone" dataKey="p90Band" stackId="net-worth-range" stroke="none" fill="#f59e0b" fillOpacity={0.13} name="75th–90th range" />
+                      <Area type="monotone" dataKey="p1Base" stackId="net-worth-range" stroke="none" fill="transparent" fillOpacity={0} legendType="none" />
+                      <Area type="monotone" dataKey="p10Band" stackId="net-worth-range" stroke="none" fill="#8b5cf6" fillOpacity={0.10} legendType="none" />
+                      <Area type="monotone" dataKey="p25Band" stackId="net-worth-range" stroke="none" fill="#06b6d4" fillOpacity={0.10} legendType="none" />
+                      <Area type="monotone" dataKey="p50Band" stackId="net-worth-range" stroke="none" fill="#10b981" fillOpacity={0.10} legendType="none" />
+                      <Area type="monotone" dataKey="p75Band" stackId="net-worth-range" stroke="none" fill="#f59e0b" fillOpacity={0.10} legendType="none" />
+                      <Area type="monotone" dataKey="p90Band" stackId="net-worth-range" stroke="none" fill="#ef4444" fillOpacity={0.10} legendType="none" />
+                      <Area type="monotone" dataKey="p99Band" stackId="net-worth-range" stroke="none" fill="#dc2626" fillOpacity={0.10} legendType="none" />
+                      <Line type="monotone" dataKey="p1" stroke="#c4b5fd" strokeWidth={1.5} dot={false} name="1st percentile" />
                       <Line type="monotone" dataKey="p10" stroke="#a78bfa" strokeWidth={1.5} dot={false} name="10th percentile" />
                       <Line type="monotone" dataKey="p25" stroke="#22d3ee" strokeWidth={1.5} dot={false} name="25th percentile" />
                       <Line type="monotone" dataKey="p50" stroke="#34d399" strokeWidth={2} dot={false} name="Median" />
                       <Line type="monotone" dataKey="p75" stroke="#fbbf24" strokeWidth={1.5} dot={false} name="75th percentile" />
                       <Line type="monotone" dataKey="p90" stroke="#f87171" strokeWidth={1.5} dot={false} name="90th percentile" />
+                      <Line type="monotone" dataKey="p99" stroke="#fb7185" strokeWidth={1.5} dot={false} name="99th percentile" />
                       <Line type="monotone" dataKey="mean" stroke="#f8fafc" strokeWidth={2} strokeDasharray="5 5" dot={false} name="Mean" />
                     </ComposedChart>
                   </ResponsiveContainer>
