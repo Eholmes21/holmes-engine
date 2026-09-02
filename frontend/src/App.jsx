@@ -2348,8 +2348,8 @@ const RUN_FILTER_OPTIONS = [
                       <h3 className="text-lg font-semibold mb-1">Monte Carlo: Planned Spending by Year</h3>
                       <p className="text-xs text-slate-500 mb-2">
                         {mcExpenseHasSpread
-                          ? 'Annual spending need, including mortgage payments and property operating shortfalls. Shading shows the simulation range.'
-                          : 'This plan has the same spending need in every run; market returns change net worth, not planned spending. Enable adaptive spending or inflation volatility to model a range.'}
+                          ? 'Annual spending need before income taxes, including mortgage payments and property operating shortfalls. Shading shows the simulation range.'
+                          : 'This plan has the same pre-tax spending need in every run; market returns change net worth, not planned spending. Enable adaptive spending or inflation volatility to model a range.'}
                       </p>
                       <ResponsiveContainer width="100%" height="84%" initialDimension={CHART_INITIAL_DIMENSION}>
                         <ComposedChart data={mcExpenseChartData} margin={{ top: 4, right: 12, left: 4, bottom: 4 }}>
