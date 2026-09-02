@@ -70,6 +70,8 @@ const DEFAULT_SALE_HAIRCUT_PCT = 10;
 const DEFAULT_WORKPLACE_CONTRIBUTION_LIMIT = 24500;
 const DEFAULT_EMPLOYER_MATCH_RATE_PCT = 13;
 const MAX_MONTE_CARLO_RUNS = 5000;
+const STANDARD_REQUEST_TIMEOUT_MS = 30000;
+const LARGE_MONTE_CARLO_TIMEOUT_MS = 180000;
 const DEFAULT_WITHDRAWAL_ORDER = ['rmds', 'taxable', 'bitcoin', 'pre_tax', 'roth', 'rental', 'primary'];
 const CHART_INITIAL_DIMENSION = { width: 640, height: 300 };
 const WITHDRAWAL_LABELS = {
@@ -749,12 +751,13 @@ export default function App() {
     const requestToken = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? crypto.randomUUID()
       : `request-${Date.now()}-${requestId}`;
+    const requestedRunCount = Math.max(1, Math.min(MAX_MONTE_CARLO_RUNS, Math.round(asNumber(mcSettings.numRuns, 100))));
     const request = requestedMode === 'historical'
       ? {
         mode: requestedMode,
         request_token: requestToken,
         params: simulationParams,
-        num_runs: Math.max(1, Math.min(MAX_MONTE_CARLO_RUNS, Math.round(asNumber(mcSettings.numRuns, 100)))),
+        num_runs: requestedRunCount,
         stock_volatility: Math.max(0, asNumber(mcSettings.stockVolatility) / 100),
         real_estate_volatility: Math.max(0, asNumber(mcSettings.realEstateVolatility) / 100),
         inflation_volatility: Math.max(0, asNumber(mcSettings.inflationVolatility) / 100),
@@ -779,7 +782,14 @@ export default function App() {
     setMcRunning(requestedMode === 'historical');
     let timeoutId;
     try {
-      timeoutId = setTimeout(() => controller.abort(), 15000);
+      // A large Monte Carlo request is intentionally allowed to run longer
+      // than a normal API call. The old fixed 15-second abort made valid
+      // 5,000-run requests look like network failures while the backend was
+      // still computing them.
+      const timeoutMs = requestedMode === 'historical' && requestedRunCount > 1000
+        ? LARGE_MONTE_CARLO_TIMEOUT_MS
+        : STANDARD_REQUEST_TIMEOUT_MS;
+      timeoutId = setTimeout(() => controller.abort(), timeoutMs);
       const endpoint = requestedMode === 'historical' ? '/monte_carlo' : '/simulate';
       const response = await fetch(`${API_URL}${endpoint}`, {
         method: 'POST',
@@ -875,7 +885,7 @@ export default function App() {
       const numRuns = Number(mcResults.request?.num_runs || mcResults.numRuns || 1);
       const idx = Math.max(0, Math.min(numRuns - 1, Number(inspectRunIndex) || 0));
 
-      timeoutId = setTimeout(() => controller.abort(), 15000);
+      timeoutId = setTimeout(() => controller.abort(), STANDARD_REQUEST_TIMEOUT_MS);
       const res = await fetch(`${API_URL}/monte_carlo_run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
